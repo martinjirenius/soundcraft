@@ -312,6 +312,9 @@ impl Plugin for Vst3Plugin {
         while start < frames {
             let n = (frames - start).min(self.max_block);
             let end = u32::try_from(start + n).unwrap_or(u32::MAX);
+            // Every buffer starts the block as silence; the main input is copied in below.
+            self.inputs.clear(n);
+            self.outputs.clear(n);
             // Feed the main input bus (mono sources fill every bus channel).
             if self.has_input {
                 for c in 0..self.inputs.channels(0) {

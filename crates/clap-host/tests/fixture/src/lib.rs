@@ -15,7 +15,10 @@
 //! - `org.soundcraft.test.faulty`: stereo effect that exercises the host's failure reporting. A
 //!   negative first input sample makes `process` return CLAP_PROCESS_ERROR. Every block it also
 //!   pushes 1025 parameter events, which the host must accept 1024 of and refuse the last one;
-//!   any other answer returns CLAP_PROCESS_ERROR too.
+//!   any other answer returns CLAP_PROCESS_ERROR too. Otherwise it copies its first input channel
+//!   to every output channel, except that a block whose first input sample is exactly 0.25 writes
+//!   no output and returns CLAP_PROCESS_CONTINUE (a plugin's output never contains a previous
+//!   block's audio: the host must hand back silence there).
 //!
 //! The gain plugin also implements `clap.state` (gain and mode as two little-endian f64s) and a
 //! floating-only `clap.gui` without a real window: showing it "edits" the gain to 0.25 in the GUI,
@@ -242,11 +245,32 @@ unsafe fn faulty_process(pr: &clap_process) -> clap_process_status {
         let accepted = unsafe { push(pr.out_events, &e.header) };
         as_expected &= accepted == (i < HOST_QUEUE);
     }
-    let fail_requested = pr.audio_inputs_count == 1 && pr.frames_count > 0 && {
+    let first = if pr.audio_inputs_count == 1 && pr.frames_count > 0 {
         let inp = unsafe { &*pr.audio_inputs };
-        inp.channel_count > 0 && unsafe { **inp.data32 } < 0.0
+        if inp.channel_count > 0 { Some(unsafe { **inp.data32 }) } else { None }
+    } else {
+        None
     };
-    if as_expected && !fail_requested { CLAP_PROCESS_CONTINUE } else { CLAP_PROCESS_ERROR }
+    if !as_expected || first.is_some_and(|x| x < 0.0) {
+        return CLAP_PROCESS_ERROR;
+    }
+    // The trigger block writes nothing: whatever the host hands back must be silence.
+    if first == Some(0.25) {
+        return CLAP_PROCESS_CONTINUE;
+    }
+    // `first` is Some only when there is an input channel to copy from.
+    if first.is_some() && pr.audio_outputs_count == 1 {
+        let (inp, out) = unsafe { (&*pr.audio_inputs, &*pr.audio_outputs) };
+        let n = pr.frames_count as usize;
+        for c in 0..out.channel_count as usize {
+            let o = unsafe { *out.data32.add(c) };
+            let i = unsafe { *inp.data32.add(c.min(inp.channel_count as usize - 1)) };
+            for k in 0..n {
+                unsafe { *o.add(k) = *i.add(k) };
+            }
+        }
+    }
+    CLAP_PROCESS_CONTINUE
 }
 
 unsafe extern "C" fn process(p: *const clap_plugin, pr: *const clap_process) -> clap_process_status {

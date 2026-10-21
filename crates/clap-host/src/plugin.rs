@@ -222,6 +222,9 @@ impl Plugin for ClapPlugin {
         while start < frames {
             let n = (frames - start).min(self.max_block);
             let end = u32::try_from(start + n).unwrap_or(u32::MAX);
+            // Every buffer starts the block as silence; the main input is copied in below.
+            self.inputs.clear(n);
+            self.outputs.clear(n);
             // Feed the main input port (mono sources fill every port channel).
             if let Some(p) = self.in_main {
                 for c in 0..self.inputs.channels(p) {

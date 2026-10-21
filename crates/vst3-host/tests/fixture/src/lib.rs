@@ -5,6 +5,8 @@
 //!   (plain 0..2, linear, units dB), 3 "Mode" (3 steps: A/B/C), 12 "Freq" (20..20000 Hz, log),
 //!   9 hidden, 11 bypass. Starts at gain 0.5 (its state) although the declared default is 1.0.
 //!   A gain of exactly 0 makes its process return kResultFalse (the failure the host must report).
+//!   A block whose first input sample is exactly 0.25 writes no output and returns kResultOk (a
+//!   plugin's output never contains a previous block's audio: the host must hand back silence).
 //!   Reports 3 samples of latency. State: the component stores the gain (one LE f64), the
 //!   controller the Freq value (one LE f64). Its controller has an editor view (`IPlugView`,
 //!   320×240, no real drawing) supporting NSView/HWND/X11.
@@ -214,6 +216,10 @@ impl IAudioProcessorTrait for GainProcessor {
         let frames = d.numSamples.max(0) as usize;
         let g = 2.0 * f64::from_bits(self.gain.load(Ordering::Relaxed)) as f32;
         let (ins, outs) = unsafe { (channels(&*d.inputs, frames), channels(&*d.outputs, frames)) };
+        // The trigger block writes nothing: whatever the host hands back must be silence.
+        if ins.first().and_then(|c| c.first()) == Some(&0.25) {
+            return kResultOk;
+        }
         for (i, o) in ins.iter().zip(outs) {
             for (x, y) in i.iter().zip(o.iter_mut()) {
                 *y = g * x;

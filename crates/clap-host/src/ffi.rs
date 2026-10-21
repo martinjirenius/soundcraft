@@ -1098,6 +1098,16 @@ impl PortBuffers {
         self.data.get_mut(port).and_then(|p| p.get_mut(ch)).map(Vec::as_mut_slice)
     }
 
+    /// Zeroes the first `frames` samples of every channel (no allocation). Run before each process
+    /// call, so a channel the plugin leaves unwritten reads as silence, not the previous block.
+    pub fn clear(&mut self, frames: usize) {
+        for ch in self.data.iter_mut().flatten() {
+            if let Some(s) = ch.get_mut(..frames) {
+                s.fill(0.0);
+            }
+        }
+    }
+
     /// Points the CLAP tables at the current data (no allocation).
     fn refresh(&mut self) {
         for ((d, p), b) in self.data.iter_mut().zip(self.ptrs.iter_mut()).zip(self.bufs.iter_mut()) {

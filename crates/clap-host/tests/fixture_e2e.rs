@@ -162,6 +162,23 @@ fn a_plugin_whose_process_errors_reports_failed_until_prepared_again() {
 }
 
 #[test]
+// Protects: a plugin's output never contains a previous block's audio. The faulty fixture writes
+// no output for a block whose first input sample is 0.25, so that block must come back silent.
+fn a_block_the_plugin_leaves_unwritten_comes_back_silent() {
+    fixture_dir();
+    let mut p = soundcraft_clap_host::create("clap:org.soundcraft.test.faulty").unwrap();
+    p.prepare(48_000.0, 64, 2);
+    let mut io = vec![vec![0.5f32; 64]; 2];
+    p.process(&mut io, 64);
+    assert!(io[0].iter().all(|&x| (x - 0.5).abs() < 1e-6), "the pass-through block is audible");
+    let mut io = vec![vec![0.25f32; 64]; 2];
+    p.process(&mut io, 64);
+    assert!(io[0].iter().all(|&x| x == 0.0), "{:?}", &io[0][..4]);
+    assert!(io[1].iter().all(|&x| x == 0.0), "{:?}", &io[1][..4]);
+    assert!(!p.failed());
+}
+
+#[test]
 fn the_output_event_queue_refuses_what_it_cannot_store() {
     // Protects: CLAP try_push returns false when the host's queue is full, rather than claiming
     // to have stored the event. The fixture pushes 1025 parameter events per block (the queue

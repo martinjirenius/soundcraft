@@ -98,9 +98,9 @@ fn gain_processes_audio_and_follows_params() {
     assert!(io[1].iter().all(|&x| (x + 0.5).abs() < 1e-6));
     // Mono strip: the plugin accepts a mono arrangement; the session value is re-sent.
     p.prepare(48_000.0, 128, 1);
-    let mut mono = vec![vec![0.25f32; 128]];
+    let mut mono = vec![vec![-0.25f32; 128]];
     p.process(&mut mono, 128);
-    assert!(mono[0].iter().all(|&x| (x - 0.5).abs() < 1e-6), "{:?}", &mono[0][..4]);
+    assert!(mono[0].iter().all(|&x| (x + 0.5).abs() < 1e-6), "{:?}", &mono[0][..4]);
     // Hostile shapes don't crash.
     p.process(&mut [], 64);
     let mut short = vec![vec![1.0f32; 4]];
@@ -134,6 +134,22 @@ fn a_failing_process_reports_failed_until_the_next_prepare() {
     p.process(&mut io, 64);
     assert!(!p.failed());
     assert!(io[0].iter().all(|&x| (x - 0.5).abs() < 1e-6), "{:?}", &io[0][..4]);
+}
+
+// Protects: a plugin's output never contains a previous block's audio. The gain fixture writes no
+// output for a block whose first input sample is 0.25, so that block must come back silent.
+#[test]
+fn a_block_the_plugin_leaves_unwritten_comes_back_silent() {
+    let mut p = soundcraft_vst3_host::create(&id_of("Fixture Gain")).unwrap();
+    p.prepare(44_100.0, 256, 2);
+    let mut io = vec![vec![0.5f32; 64], vec![0.5f32; 64]];
+    p.process(&mut io, 64);
+    assert!(io[0].iter().all(|&x| x > 0.0), "the pass-through block is audible: {:?}", &io[0][..4]);
+    let mut io = vec![vec![0.25f32; 64], vec![0.25f32; 64]];
+    p.process(&mut io, 64);
+    assert!(io[0].iter().all(|&x| x == 0.0), "{:?}", &io[0][..4]);
+    assert!(io[1].iter().all(|&x| x == 0.0), "{:?}", &io[1][..4]);
+    assert!(!p.failed());
 }
 
 #[test]

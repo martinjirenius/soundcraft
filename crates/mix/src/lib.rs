@@ -160,8 +160,9 @@ pub struct StripMeter {
     pub plugin_failures: PluginFailures,
 }
 
-/// How often a strip's plugins were taken out of the signal path for putting out NaN or infinity.
-/// Each stays out until the engine is next reset (playback starts or stops).
+/// How often a strip's plugins were taken out of the signal path, either for putting out NaN or
+/// infinity or for reporting [`Plugin::failed`]. Each stays out until the engine is next reset
+/// (playback starts or stops).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PluginFailures {
     /// It only grows.
@@ -1092,11 +1093,14 @@ fn process_strip(
     }
 }
 
-/// Silences a block the plugin filled with NaN or infinity and takes the plugin out until the
-/// next [`MixEngine::reset`]. True then.
+/// Silences a block the plugin failed on, and takes the plugin out until the next
+/// [`MixEngine::reset`]. A failure is NaN or infinity in the block, or the plugin reporting
+/// [`Plugin::failed`] after processing it. Every plugin slot goes through here, so one rule
+/// covers inserts, the instrument and master inserts alike. True then.
 fn contain_failure(slot: &mut PluginSlot, buf: &mut [Vec<f32>], frames: usize) -> bool {
     // A branch-free fold vectorizes; `all` runs about 8 times slower here.
-    if buf.iter().all(|c| c.get(..frames).unwrap_or(c).iter().fold(true, |ok, x| ok & x.is_finite())) {
+    let finite = buf.iter().all(|c| c.get(..frames).unwrap_or(c).iter().fold(true, |ok, x| ok & x.is_finite()));
+    if finite && !slot.plugin.failed() {
         return false;
     }
     for c in buf.iter_mut() {
@@ -2802,6 +2806,33 @@ mod tests {
         assert!(eng.drain_plugins().is_empty());
     }
 
+    /// A gain that reports [`Plugin::failed`] after every block, with its audio intact.
+    struct Failing(Box<dyn Plugin>);
+
+    impl Plugin for Failing {
+        fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
+            self.0.info()
+        }
+        fn prepare(&mut self, sr: f32, mb: usize, ch: usize) {
+            self.0.prepare(sr, mb, ch);
+        }
+        fn reset(&mut self) {
+            self.0.reset();
+        }
+        fn set_param(&mut self, id: &str, v: f32) -> bool {
+            self.0.set_param(id, v)
+        }
+        fn param(&self, id: &str) -> Option<f32> {
+            self.0.param(id)
+        }
+        fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+            self.0.process(io, frames);
+        }
+        fn failed(&self) -> bool {
+            true
+        }
+    }
+
     struct Nan(Box<dyn Plugin>);
 
     impl Plugin for Nan {
@@ -2849,6 +2880,45 @@ mod tests {
         eng.reset();
         assert_eq!(render_block(&mut eng, &s, 1536), only_b);
         assert_eq!(eng.meters[&a].plugin_failures.count, 2);
+    }
+
+    #[test]
+    fn a_plugin_reporting_failure_is_contained_like_nan_and_retried_on_reset() {
+        // Contract: `Plugin::failed` after a block takes the plugin out exactly as NaN does
+        // (silent block, counted in its strip's PluginFailures, bypassed until reset, retried after).
+        let (mut s, a) = session_with_dc(0.5, 48_000);
+        let b = add_dc_track(&mut s, 0.5, 48_000);
+        s.track_mut(a).unwrap().mixer.inserts[2] = Some(Insert::new("clap:test.failing"));
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        let both = render_block(&mut eng, &s, 0);
+        let failing = |track, slot, ch| {
+            let plugin = Box::new(Failing(soundcraft_dsp::create("gain").unwrap()));
+            vec![PreparedInstance { track, slot, id: "clap:test.failing".into(), ch, plugin }]
+        };
+        eng.adopt(failing(a, 2, 1));
+        let only_b = render_block(&mut eng, &s, 512);
+        assert!(only_b > 0.3 && (only_b - both / 2.0).abs() < 1e-6, "{only_b} vs {both}");
+        assert_eq!(eng.meters[&a].plugin_failures, PluginFailures { count: 1, last: 2 });
+        assert_eq!(eng.meters[&b].plugin_failures, PluginFailures::default());
+        assert_eq!(render_block(&mut eng, &s, 1024), both);
+        eng.reset();
+        assert_eq!(render_block(&mut eng, &s, 1536), only_b);
+        assert_eq!(eng.meters[&a].plugin_failures.count, 2);
+
+        // The instrument slot shares the rule.
+        let mut s = synth_session(-6.0);
+        let synth = s.tracks[0].id;
+        s.track_mut(synth).unwrap().instrument = Some(Insert::new("clap:test.failing"));
+        let b = add_dc_track(&mut s, 0.5, 48_000);
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        let plugin = Box::new(Failing(soundcraft_dsp::create("gain").unwrap()));
+        eng.adopt(vec![PreparedInstance { track: synth, slot: INSTRUMENT_SLOT, id: "clap:test.failing".into(), ch: 2, plugin }]);
+        let only_b = render_block(&mut eng, &s, 0);
+        assert!(only_b > 0.3, "{only_b}");
+        assert_eq!(eng.meters[&synth].plugin_failures, PluginFailures { count: 1, last: INSTRUMENT_SLOT });
+        assert_eq!(eng.meters[&b].plugin_failures, PluginFailures::default());
     }
 
     #[test]

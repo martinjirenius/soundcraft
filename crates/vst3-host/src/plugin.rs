@@ -3,7 +3,7 @@
 use crate::ffi::{
     AFTERTOUCH, BusBuffers, EVENT_CAP, EditorLink, Fault, HostContext, Instance, NoteEvent, PARAM_PROGRAM_CHANGE, PARAM_QUEUE_CAP, PITCH_BEND,
 };
-use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, Transport, Unit};
+use soundcraft_dsp::{ParkGate, Plugin, PluginEditor, PluginInfo, PluginService, ServiceReport, Transport, Unit};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,6 +39,9 @@ pub struct Vst3Plugin {
     /// Whether the host has set each parameter (same order as `ids`). Only those are re-sent when
     /// the plugin is re-activated; the rest are the plugin's own values.
     host_set: Vec<bool>,
+    /// The normalized value of each host-set parameter (same order), kept so a restart can re-send
+    /// it without asking the controller.
+    host_norm: Vec<f64>,
     /// Whether each parameter is a program change (VST3 `kIsProgramChange`, same order as `ids`).
     /// Never re-sent: that would reload a patch over the plugin's own edits.
     program_change: Vec<bool>,
@@ -62,16 +65,16 @@ pub struct Vst3Plugin {
     held: [bool; 128],
     channels: usize,
     max_block: usize,
-    latency: usize,
     tail: usize,
     position: i64,
     transport: Option<Transport>,
     /// Set when activation failed in `prepare` or a block failed in `process`; cleared by the
     /// next successful `prepare`. The plugin's last block is then not its sound.
     failed: bool,
-    /// The first `process` failure since the last report, recorded on the audio thread and logged
-    /// by the next `prepare` (main thread; `reset` runs on the audio thread and never logs).
-    fault: Option<Fault>,
+    /// How this audio thread and the main-thread service share the plugin (see [`ParkGate`]).
+    gate: Arc<ParkGate>,
+    /// Restarts of the plugin the audio thread has seen: on a new one it re-sends the host-set values.
+    restarts_seen: u64,
 }
 
 impl Vst3Plugin {
@@ -104,6 +107,7 @@ impl Vst3Plugin {
             info,
             values: Vec::with_capacity(ids.len()),
             host_set: vec![false; ids.len()],
+            host_norm: vec![0.0; ids.len()],
             program_change,
             pending: Vec::with_capacity(ids.len().min(PARAM_QUEUE_CAP)),
             unsynced: ids.iter().map(|_| AtomicU64::new(SYNCED)).collect(),
@@ -118,12 +122,12 @@ impl Vst3Plugin {
             held: [false; 128],
             channels: 2,
             max_block: 0,
-            latency: 0,
             tail: 0,
             position: 0,
             transport: None,
             failed: false,
-            fault: None,
+            gate: Arc::clone(&inst.host().gate),
+            restarts_seen: 0,
             ids,
             maps,
             inst,
@@ -188,10 +192,27 @@ impl Vst3Plugin {
         }
     }
 
-    /// Logs the first recorded `process` failure, if any (main thread: `prepare` only).
+    /// Logs the first recorded `process` failure, if the service has not yet (main thread:
+    /// `prepare` only).
     fn report_fault(&mut self) {
-        if let Some(f) = self.fault.take() {
+        if let Some(f) = Fault::decode(self.inst.host().fault.swap(0, Ordering::AcqRel)) {
             log::warn!("{}: VST3 processing failed: {f}", self.info.id);
+        }
+    }
+
+    /// Queues the values the host set (a value only the plugin set is its own, and a program
+    /// change is never re-sent) so a re-activated plugin matches the session. Allocation-free.
+    fn resend_host_set(&mut self) {
+        self.pending.clear();
+        for i in 0..self.ids.len().min(PARAM_QUEUE_CAP) {
+            if !self.host_set.get(i).copied().unwrap_or(false) || self.program_change.get(i).copied().unwrap_or(true) {
+                continue;
+            }
+            if let (Some(&id), Some(&n)) = (self.ids.get(i), self.host_norm.get(i))
+                && self.pending.len() < self.pending.capacity()
+            {
+                self.pending.push((id, n));
+            }
         }
     }
 
@@ -225,7 +246,8 @@ impl Plugin for Vst3Plugin {
                 self.has_output = layout.outputs.first().is_some_and(|&c| c > 0);
                 self.event_input = layout.event_input;
                 self.max_block = mb;
-                self.latency = self.inst.latency() as usize;
+                self.inst.host().latency.store(self.inst.latency(), Ordering::Release);
+                self.inst.host().failed.store(false, Ordering::Release);
                 self.tail = self.inst.tail() as usize;
                 self.midi_map = self.inst.midi_mapping();
                 self.failed = false;
@@ -236,21 +258,13 @@ impl Plugin for Vst3Plugin {
             }
             Err(e) => {
                 log::warn!("{}: {e}", self.info.id);
-                self.latency = 0;
+                self.inst.host().latency.store(0, Ordering::Release);
                 self.failed = true;
             }
         }
-        // Re-send the values the host set so a re-activated plugin matches the session. A value only
-        // the plugin set is its own, and a program change is never re-sent.
-        self.pending.clear();
-        for i in 0..self.ids.len().min(PARAM_QUEUE_CAP) {
-            if !self.host_set.get(i).copied().unwrap_or(false) || self.program_change.get(i).copied().unwrap_or(true) {
-                continue;
-            }
-            if let (Some(&id), Some(n)) = (self.ids.get(i), self.values.get(i).and_then(|&v| self.normalized_from_plain(i, v))) {
-                self.pending.push((id, n));
-            }
-        }
+        // Re-send the values the host set so a re-activated plugin matches the session.
+        self.resend_host_set();
+        self.restarts_seen = self.inst.host().restarts.load(Ordering::Acquire);
     }
 
     fn reset(&mut self) {
@@ -271,6 +285,9 @@ impl Plugin for Vst3Plugin {
             *h = true;
         }
         let Some(n) = self.normalized_from_plain(i, v) else { return true };
+        if let Some(slot) = self.host_norm.get_mut(i) {
+            *slot = n;
+        }
         if let Some(u) = self.unsynced.get(i) {
             u.store(n.to_bits(), Ordering::Relaxed);
         }
@@ -288,6 +305,16 @@ impl Plugin for Vst3Plugin {
     }
 
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+        // While the main thread has the plugin parked (a restart it is servicing) the plugin
+        // counts as inactive: the buffers are left as they are.
+        let gate = Arc::clone(&self.gate);
+        let Some(_busy) = gate.enter() else { return };
+        let restarts = self.inst.host().restarts.load(Ordering::Acquire);
+        if restarts != self.restarts_seen {
+            // The plugin was re-activated since the last block: give it back what the host set.
+            self.restarts_seen = restarts;
+            self.resend_host_set();
+        }
         if !self.inst.is_active() || self.max_block == 0 {
             return;
         }
@@ -295,9 +322,6 @@ impl Plugin for Vst3Plugin {
         let frames = io.iter().take(ch).map(Vec::len).fold(frames, usize::min);
         if frames == 0 || ch == 0 {
             return;
-        }
-        if self.inst.host().latency_changed.swap(false, Ordering::Relaxed) {
-            self.latency = self.inst.latency() as usize;
         }
         let last = u32::try_from(frames - 1).unwrap_or(u32::MAX);
         for e in &mut self.notes {
@@ -342,10 +366,7 @@ impl Plugin for Vst3Plugin {
             self.notes.drain(..k);
             self.position = self.position.saturating_add(i64::try_from(n).unwrap_or(0));
             match r {
-                Err(f) => {
-                    self.failed = true;
-                    self.fault.get_or_insert(f);
-                }
+                Err(_) => self.failed = true,
                 Ok(()) if self.has_output => {
                     let oc = self.outputs.channels(0);
                     for (c, dst) in io.iter_mut().take(ch).enumerate() {
@@ -369,11 +390,11 @@ impl Plugin for Vst3Plugin {
     }
 
     fn failed(&self) -> bool {
-        self.failed
+        self.failed || self.inst.host().failed.load(Ordering::Acquire)
     }
 
     fn latency(&self) -> usize {
-        self.latency
+        self.inst.host().latency.load(Ordering::Acquire) as usize
     }
 
     fn set_transport(&mut self, transport: &Transport) {
@@ -466,6 +487,21 @@ impl Plugin for Vst3Plugin {
         }))
     }
 
+    fn service_handle(&mut self) -> Option<Box<dyn PluginService>> {
+        let link = self.inst.state_link();
+        Some(Box::new(Vst3Service {
+            ed: Vst3Editor {
+                link,
+                host: self.inst.host_ref(),
+                info: self.info,
+                index: self.info.params.iter().enumerate().map(|(i, p)| (p.id, i)).collect(),
+                units: Vec::new(),
+                ids: self.ids.clone(),
+                maps: self.maps.clone(),
+            },
+        }))
+    }
+
     fn state_reader(&mut self) -> Option<Box<dyn soundcraft_dsp::PluginStateReader>> {
         let (link, ids, unsynced) = (self.inst.state_link(), self.ids.clone(), Arc::clone(&self.unsynced));
         Some(Box::new(move || {
@@ -479,6 +515,25 @@ impl Plugin for Vst3Plugin {
             }
             link.save_state()
         }))
+    }
+}
+
+/// The main-thread service point of a hosted VST3 plugin (see [`PluginService`]); it reads values
+/// the way the editor does.
+struct Vst3Service {
+    ed: Vst3Editor,
+}
+
+impl PluginService for Vst3Service {
+    fn service(&mut self) -> ServiceReport {
+        let r = self.ed.link.service(&self.ed.host, self.ed.info.id);
+        ServiceReport { values_changed: r.values_changed, dirty: r.dirty }
+    }
+
+    fn live_param(&mut self, id: &str) -> Option<f32> {
+        let &i = self.ed.index.get(id)?;
+        let n = self.ed.link.live_normalized(*self.ed.ids.get(i)?)?;
+        self.ed.plain(i, n)
     }
 }
 

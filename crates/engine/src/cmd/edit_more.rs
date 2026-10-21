@@ -855,6 +855,7 @@ fn coalesce_clip_gain_to_volume(e: &mut Engine, p: &Value) -> Result<Value> {
 }
 
 fn trim_glide(e: &mut Engine, p: &Value, glide: bool, pan_only: bool, id: &str) -> Result<Value> {
+    let live = e.live_params();
     let tracks = tracks_required(e, id, p)?;
     let r = nonempty_range(e, p, id)?;
     let s = e.session_mut();
@@ -877,7 +878,8 @@ fn trim_glide(e: &mut Engine, p: &Value, glide: bool, pan_only: bool, id: &str) 
             }
         }
         for param in params {
-            let cur = super::mix::current_value(tr, &param);
+            // A hosted parameter nobody set that no live plugin can read has no value to glide to.
+            let Some(cur) = super::mix::current_value(live.as_deref(), tr, &param) else { continue };
             let (lo, hi, _) = param.range();
             let l = tr.lane_mut(&param);
             let before = l.value_at(r.start - 1, cur);

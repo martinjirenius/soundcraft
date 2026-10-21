@@ -26,6 +26,12 @@
 //! still works for them.
 //! Parameter changes made in the plugin's GUI arrive as output events while the plugin processes
 //! and are reported by the editor's `idle`.
+//!
+//! What a plugin asks of the host (`request_callback`, `request_restart`, `params.rescan`,
+//! `params.request_flush`, `state.mark_dirty`, `latency.changed`) is answered on the main thread by
+//! the plugin's [`soundcraft_dsp::PluginService`] ([`Plugin::service_handle`]), whether or not its
+//! editor is open. A restart deactivates and re-activates the plugin there, with the audio thread
+//! parked (see [`soundcraft_dsp::ParkGate`]): meanwhile `process` leaves its buffers as they are.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 

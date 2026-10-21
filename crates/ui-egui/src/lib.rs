@@ -282,6 +282,10 @@ pub struct SoundApp {
     /// Folder for user plugin presets (native apps set it).
     pub preset_dir: Option<std::path::PathBuf>,
     last_autosave: Option<std::time::Instant>,
+    /// A hosted plugin said its state changed (`mark_dirty`), and when its states were last
+    /// captured into the session for it (at most once a second).
+    plugin_state_dirty: bool,
+    last_state_capture: Option<std::time::Instant>,
     pub dialogs: dialogs::Dialogs,
     pub meters: HashMap<TrackId, MeterDisplay>,
     pub main_meter: MeterDisplay,
@@ -370,6 +374,8 @@ impl SoundApp {
             panic_rev: 0,
             preset_dir: None,
             last_autosave: None,
+            plugin_state_dirty: false,
+            last_state_capture: None,
             dialogs: dialogs::Dialogs::default(),
             meters: HashMap::new(),
             main_meter: MeterDisplay::default(),
@@ -642,10 +648,22 @@ impl SoundApp {
         }
     }
 
-    /// Parameter edits made in plugin editors go into the session (one undo step per gesture).
+    /// The main-thread service tick of every hosted plugin (what they ask of the host is answered
+    /// whether or not their editor is open), and what comes of it: parameter edits made in plugin
+    /// editors go into the session (one undo step per gesture), the plugins' own live values reach
+    /// the engine's commands, and a plugin whose state changed has it captured into the session
+    /// (so the session is modified), at most once a second.
     fn apply_editor_edits(&mut self) {
         let Some(p) = &self.player else { return };
-        for (t, slot, param, value) in p.idle() {
+        self.engine.set_live_params(Some(p.live_params()));
+        let idle = p.idle();
+        self.plugin_state_dirty |= !idle.dirty.is_empty();
+        if self.plugin_state_dirty && self.last_state_capture.is_none_or(|t| t.elapsed().as_secs_f32() >= 1.0) {
+            self.plugin_state_dirty = false;
+            self.last_state_capture = Some(std::time::Instant::now());
+            self.capture_plugin_states();
+        }
+        for (t, slot, param, value) in idle.edits {
             if slot == soundcraft_mix::INSTRUMENT_SLOT {
                 continue;
             }
@@ -1191,7 +1209,17 @@ impl SoundApp {
         // Autosave and the macOS menu bar only run on frames, and plugin editors are native windows egui never hears from.
         // egui takes its predicted frame time off every delay, so add it back.
         let editors = self.player.as_ref().is_some_and(Player::any_editor_open);
-        ctx.request_repaint_after_secs(if editors { 0.03 } else { 1.0 } + ctx.input(|i| i.predicted_dt));
+        // Hosted plugins ask things of the host at any time: keep the service tick going.
+        let hosted = self.player.as_ref().is_some_and(Player::has_plugins);
+        ctx.request_repaint_after_secs(
+            if editors {
+                0.03
+            } else if hosted {
+                0.1
+            } else {
+                1.0
+            } + ctx.input(|i| i.predicted_dt),
+        );
         control::collect_screenshots(self, ctx);
     }
 

@@ -1,8 +1,8 @@
 //! `ClapPlugin`: a loaded CLAP instance behind the safe `soundcraft_dsp::Plugin` trait.
 
-use crate::ffi::{EVENT_CAP, Event, GuiLink, Instance, NotePort, PortBuffers};
+use crate::ffi::{EVENT_CAP, Event, Fault, GuiLink, Instance, NotePort, PortBuffers, layout_sig};
 use clap_sys::ext::note_ports::{CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_MIDI};
-use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, Transport};
+use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, PluginService, ServiceReport, Transport};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -38,11 +38,13 @@ pub struct ClapPlugin {
     held: [bool; 128],
     channels: usize,
     max_block: usize,
-    latency: usize,
     steady: i64,
     transport: Option<Transport>,
-    /// Set when activation or processing failed; cleared by a successful `prepare`.
+    /// Set when activation or processing failed; cleared by a successful `prepare`. (The host
+    /// state's own `failed` flag carries the failures only the instance or the service saw.)
     failed: bool,
+    /// A `reset` came while the main thread had the plugin parked: do it before the next block.
+    reset_pending: bool,
     /// Input events dropped because `queue` was full (reported by `report_dropped`).
     dropped_in: usize,
 }
@@ -66,11 +68,19 @@ impl ClapPlugin {
             held: [false; 128],
             channels: 2,
             max_block: 0,
-            latency: 0,
             steady: 0,
             transport: None,
             failed: false,
+            reset_pending: false,
             dropped_in: 0,
+        }
+    }
+
+    /// Logs the process failure the audio thread recorded, if the service has not yet. Logs and
+    /// so allocates: main thread only (`prepare`).
+    fn report_fault(&mut self) {
+        if let Some(f) = Fault::from_code(self.inst.state().fault.swap(0, Ordering::AcqRel)) {
+            log::warn!("{}: CLAP processing failed: {f}", self.info.id);
         }
     }
 
@@ -130,6 +140,7 @@ impl Plugin for ClapPlugin {
 
     fn prepare(&mut self, sample_rate: f32, max_block: usize, channels: usize) {
         self.report_dropped();
+        self.report_fault();
         let sr = if sample_rate.is_finite() && sample_rate > 0.0 { f64::from(sample_rate) } else { 48_000.0 };
         let mb = max_block.clamp(1, MAX_BLOCK);
         self.channels = channels.clamp(1, MAX_CHANNELS);
@@ -147,12 +158,15 @@ impl Plugin for ClapPlugin {
                 self.in_main = None;
                 self.out_main = None;
                 self.max_block = 0;
-                self.latency = 0;
+                self.inst.state().latency.store(0, Ordering::Release);
+                self.inst.state().failed.store(true, Ordering::Release);
                 return;
             }
         };
         self.in_main = pick_main(&ins);
         self.out_main = pick_main(&outs);
+        // What the host's buffers are built for: a restart that changes it cannot be applied live.
+        self.inst.state().layout.store(layout_sig(&ins, &outs), Ordering::Release);
         self.inputs = PortBuffers::new(&ins.iter().map(|p| p.channels).collect::<Vec<_>>(), mb);
         self.outputs = PortBuffers::new(&outs.iter().map(|p| p.channels).collect::<Vec<_>>(), mb);
         let port = self.inst.note_port();
@@ -162,14 +176,15 @@ impl Plugin for ClapPlugin {
         self.inst.state().restart.store(false, Ordering::Relaxed);
         match self.inst.activate(sr, 1, u32::try_from(mb).unwrap_or(u32::MAX)) {
             Ok(()) => {
-                self.latency = self.inst.latency() as usize;
+                self.inst.state().latency.store(self.inst.latency(), Ordering::Release);
                 self.inst.state().latency_changed.store(false, Ordering::Relaxed);
+                self.inst.state().failed.store(false, Ordering::Release);
                 self.failed = false;
             }
             Err(e) => {
                 log::warn!("{}: {e}", self.info.id);
                 self.failed = true;
-                self.latency = 0;
+                self.inst.state().latency.store(0, Ordering::Release);
             }
         }
     }
@@ -177,7 +192,12 @@ impl Plugin for ClapPlugin {
     fn reset(&mut self) {
         // Runs on the audio thread: no logging here. The drop counts carry over to the next
         // `prepare`, which reports them.
-        self.inst.reset();
+        let gate = Arc::clone(&self.inst.state().gate);
+        if let Some(_busy) = gate.enter() {
+            self.inst.reset();
+        } else {
+            self.reset_pending = true;
+        }
         self.queue.retain(|e| matches!(e, Event::Param { .. }));
         self.held = [false; 128];
     }
@@ -204,6 +224,14 @@ impl Plugin for ClapPlugin {
     }
 
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+        // While the main thread has the plugin parked (a restart or flush it is servicing) the
+        // plugin counts as inactive: the buffers are left as they are.
+        let gate = Arc::clone(&self.inst.state().gate);
+        let Some(_busy) = gate.enter() else { return };
+        self.inst.state().blocks.fetch_add(1, Ordering::Relaxed);
+        if std::mem::take(&mut self.reset_pending) {
+            self.inst.reset();
+        }
         if !self.inst.is_active() || self.max_block == 0 {
             return;
         }
@@ -265,11 +293,11 @@ impl Plugin for ClapPlugin {
     }
 
     fn latency(&self) -> usize {
-        self.latency
+        self.inst.state().latency.load(Ordering::Acquire) as usize
     }
 
     fn failed(&self) -> bool {
-        self.failed
+        self.failed || self.inst.state().failed.load(Ordering::Acquire)
     }
 
     fn set_transport(&mut self, transport: &Transport) {
@@ -349,6 +377,30 @@ impl Plugin for ClapPlugin {
         let link = self.inst.state_link()?;
         Some(Box::new(move || link.save_state()))
     }
+
+    fn service_handle(&mut self) -> Option<Box<dyn PluginService>> {
+        Some(Box::new(ClapService { link: self.inst.link(), info: self.info, ids: self.ids.clone() }))
+    }
+}
+
+/// The main-thread service point of a hosted CLAP plugin (see [`PluginService`]).
+struct ClapService {
+    link: Arc<GuiLink>,
+    info: &'static PluginInfo,
+    ids: Vec<u32>,
+}
+
+impl PluginService for ClapService {
+    fn service(&mut self) -> ServiceReport {
+        let r = self.link.service(self.info.id);
+        ServiceReport { values_changed: r.values_changed, dirty: r.dirty }
+    }
+
+    fn live_param(&mut self, id: &str) -> Option<f32> {
+        let i = self.info.params.iter().position(|p| p.id == id)?;
+        let v = self.link.param_value(*self.ids.get(i)?)?;
+        Some(self.info.params.get(i)?.clamp(v as f32))
+    }
 }
 
 /// A CLAP plugin's floating editor, driven from the main thread (see [`GuiLink`]).
@@ -375,7 +427,6 @@ impl PluginEditor for ClapEditor {
 
     fn idle(&mut self) -> Vec<(String, f32)> {
         let raw = self.link.idle();
-        let _ = self.link.host().dirty.swap(false, Ordering::Relaxed);
         let mut out: Vec<(String, f32)> = Vec::new();
         for (cid, v) in raw {
             let Some(i) = self.ids.iter().position(|&x| x == cid) else { continue };

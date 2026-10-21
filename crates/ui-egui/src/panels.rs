@@ -506,10 +506,17 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
                 if info.id == "eq_7band" || info.id == "eq_1band" {
                     eq_curve(ui, info.id, &ins);
                 }
+                // A hosted plugin's parameter nobody set is the plugin's own: show its live value.
+                let live = app.player.as_ref().filter(|_| soundcraft_mix::is_third_party(&ins.plugin)).map(soundcraft_playback::Player::live_params);
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     egui::Grid::new(("pg", tid.0, slot)).num_columns(3).show(ui, |ui| {
                         for p in info.params {
-                            let v = ins.params.get(p.id).copied().unwrap_or(p.default);
+                            let v = ins
+                                .params
+                                .get(p.id)
+                                .copied()
+                                .or_else(|| live.as_ref().and_then(|l| l.live_value(tid, slot, p.id)))
+                                .unwrap_or(p.default);
                             ui.label(p.name);
                             let mut x = v;
                             let resp = if !p.choices.is_empty() {

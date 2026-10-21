@@ -37,6 +37,11 @@
 //!   creates third-party plugins itself, synchronously, restores their stored state before the
 //!   first `process`, and drops retired instances at the end of `sync`.
 //!
+//! - hosted plugins ask things of their host (restarts, callbacks, parameter rescans and flushes,
+//!   state changes). A realtime host answers them on its main thread through each instance's
+//!   [`Plugin::service_handle`]; an engine that owns its plugins (the default: offline renders and
+//!   bounces) answers them between blocks, at the start of every [`MixEngine::render`].
+//!
 //! An instance starts from its stored state; the insert's parameter values are then applied on
 //! top before the first block (the session's values are kept in step with the plugin, including
 //! edits made in its own editor, so both agree; the state carries everything else). A host reads
@@ -51,7 +56,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use soundcraft_dsp::pan::{PanLaw, SpeakerPos, SurroundParams, gains};
-use soundcraft_dsp::{Plugin, SampleSource, Transport, db_to_gain};
+use soundcraft_dsp::{Plugin, PluginService, SampleSource, Transport, db_to_gain};
 use soundcraft_midi::CtrlKind;
 use soundcraft_model::{
     AutoParam, BusId, ChannelFormat, Clip, ClipContent, Route, Session, SourceAudio, Speaker, SurroundPan, Track, TrackId, TrackKind,
@@ -95,6 +100,15 @@ pub struct InstanceSpec {
     pub ch: usize,
     /// Decoded [`Insert::state`](soundcraft_model::Insert::state).
     pub state: Option<Vec<u8>>,
+}
+
+/// Where a host reads a hosted plugin's own current parameter value (SoundCraft units) from, for
+/// what it shows and for the start of an automation pass on a parameter nobody set. The value
+/// comes from the live plugin, never from the parameter's advertised default.
+pub trait LiveParams: Send + Sync {
+    /// The live value of insert `slot`'s parameter `param` on `track`; `None` when no such plugin
+    /// is running or it cannot say. Main thread only.
+    fn live_value(&self, track: TrackId, slot: usize, param: &str) -> Option<f32>;
 }
 
 /// A plugin instance created and prepared off the audio thread, handed to [`MixEngine::adopt`].
@@ -216,6 +230,9 @@ struct PluginSlot {
     /// Last values pushed for automation lanes on parameters that are not stored, by lane index.
     applied_lanes: Vec<f32>,
     failed: bool,
+    /// The slot's main-thread service point, kept here when this engine owns its plugins (offline
+    /// renders: `render` services them between blocks). A realtime host keeps the handles itself.
+    service: Option<Box<dyn PluginService>>,
 }
 
 struct Strip {
@@ -401,7 +418,7 @@ impl SlotCtx<'_> {
     /// A new instance for `ins` on track `t`, slot `idx`, prepared for `ch` channels.
     fn make(&mut self, t: TrackId, idx: usize, ins: &soundcraft_model::Insert, ch: usize) -> Option<PluginSlot> {
         let third = is_third_party(&ins.plugin);
-        let plugin = if third && self.external {
+        let mut plugin = if third && self.external {
             match self.adopt.remove(&(t, idx)) {
                 Some(p) if p.id == ins.plugin && p.ch == ch => Some(p.plugin),
                 Some(p) => {
@@ -414,7 +431,8 @@ impl SlotCtx<'_> {
             let state = if third { ins.state_bytes() } else { None };
             create_instance(&ins.plugin, state.as_deref(), self.sr, self.mb, ch).map(|n| n.plugin)
         }?;
-        Some(PluginSlot { id: ins.plugin.clone(), ch, plugin, applied: Vec::new(), applied_lanes: Vec::new(), failed: false })
+        let service = if third && !self.external { plugin.service_handle() } else { None };
+        Some(PluginSlot { id: ins.plugin.clone(), ch, plugin, applied: Vec::new(), applied_lanes: Vec::new(), failed: false, service })
     }
 }
 
@@ -603,6 +621,22 @@ impl MixEngine {
         self.busses.retain(|id, _| s.bus(*id).is_some());
     }
 
+    /// Answers what the plugins this engine owns asked of their host (restarts, callbacks, rescans,
+    /// flushes), between blocks. Offline renders and bounces have no other thread to do it; a
+    /// realtime host (external instances) services the plugins it keeps handles for.
+    fn service_plugins(&mut self) {
+        if self.external {
+            return;
+        }
+        for st in self.strips.values_mut() {
+            for slot in st.plugins.iter_mut().flatten().chain(st.instrument.iter_mut()) {
+                if let Some(svc) = slot.service.as_mut() {
+                    svc.service();
+                }
+            }
+        }
+    }
+
     /// Re-syncs plugin instances and the routing order when the session's structure changed
     /// since the last sync (or instances were adopted). `render` calls it; a realtime host may
     /// also call it right after swapping sessions so slots are filled before playback starts.
@@ -630,6 +664,7 @@ impl MixEngine {
         }
         self.last_end = pos.saturating_add(frames as i64);
         self.ensure_synced(s);
+        self.service_plugins();
         for b in self.busses.values_mut() {
             for c in b.buf.iter_mut() {
                 c.iter_mut().take(frames).for_each(|x| *x = 0.0);

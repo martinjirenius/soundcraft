@@ -27,8 +27,8 @@ pub mod record;
 
 pub use devices::AudioConfig;
 
-use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
-use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
+use soundcraft_dsp::{Plugin, PluginEditor, PluginService, PluginStateReader};
+use soundcraft_mix::{LiveParams, MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
 use soundcraft_model::{Session, TrackId};
 use soundcraft_time::{Range, Samples};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -57,6 +57,33 @@ pub type PluginStates = Vec<(TrackId, usize, Vec<u8>)>;
 
 /// A parameter edit made in a plugin's own editor: `(track, slot, param id, value)`.
 pub type EditorEdit = (TrackId, usize, String, f32);
+
+/// What one [`Player::idle`] tick found.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Idle {
+    /// Parameter edits made in open plugin editors.
+    pub edits: Vec<EditorEdit>,
+    /// Plugins (track, slot) whose state changed (`mark_dirty`, `setDirty`): the session should
+    /// capture them.
+    pub dirty: Vec<(TrackId, usize)>,
+}
+
+/// The main-thread service points of the live third-party instances, which is also where a host
+/// reads a plugin's own parameter values from.
+#[derive(Default)]
+struct LiveServices(Mutex<HashMap<(TrackId, usize), Box<dyn PluginService>>>);
+
+impl LiveServices {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(TrackId, usize), Box<dyn PluginService>>> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl LiveParams for LiveServices {
+    fn live_value(&self, track: TrackId, slot: usize, param: &str) -> Option<f32> {
+        self.lock().get_mut(&(track, slot))?.live_param(param)
+    }
+}
 
 enum Cmd {
     /// A new snapshot plus the third-party instances it needs (created on the UI thread).
@@ -410,6 +437,8 @@ struct Side {
     editors: HashMap<(TrackId, usize), Box<dyn PluginEditor>>,
     /// State readers of the live instances.
     states: BTreeMap<(TrackId, usize), Box<dyn PluginStateReader>>,
+    /// Service points of the live instances (also the live parameter reader).
+    services: Arc<LiveServices>,
     /// Instances that refused their stored state: saves keep that state until the plugin's editor
     /// is opened.
     refused: HashSet<(TrackId, usize)>,
@@ -419,7 +448,16 @@ struct Side {
 
 impl Side {
     fn new(rate: f32, garbage: Receiver<Vec<Box<dyn Plugin>>>) -> Side {
-        Side { shadow: HashMap::new(), rate, editors: HashMap::new(), states: BTreeMap::new(), refused: HashSet::new(), garbage, old_sessions: None }
+        Side {
+            shadow: HashMap::new(),
+            rate,
+            editors: HashMap::new(),
+            states: BTreeMap::new(),
+            services: Arc::default(),
+            refused: HashSet::new(),
+            garbage,
+            old_sessions: None,
+        }
     }
 
     /// Drops retired instances (closing their editors first, inside the plugin's drop) and
@@ -442,9 +480,27 @@ impl Side {
         let _ = tx.send(Cmd::OldSessions(otx));
     }
 
+    /// One service tick (see [`Player::idle`]).
+    fn idle(&mut self) -> Idle {
+        self.collect_garbage();
+        let mut out = Idle::default();
+        for (&key, svc) in self.services.lock().iter_mut() {
+            if svc.service().dirty {
+                out.dirty.push(key);
+            }
+        }
+        for (&(t, slot), e) in self.editors.iter_mut() {
+            for (id, v) in e.idle() {
+                out.edits.push((t, slot, id, v));
+            }
+        }
+        out
+    }
+
     fn forget(&mut self, key: (TrackId, usize)) {
         self.shadow.remove(&key);
         self.states.remove(&key);
+        self.services.lock().remove(&key);
         self.refused.remove(&key);
         if let Some(mut e) = self.editors.remove(&key) {
             e.close();
@@ -684,18 +740,24 @@ impl Player {
         self.side().capture_states()
     }
 
-    /// Per-UI-frame housekeeping: drops retired instances and services plugin editors. Returns
-    /// the parameter edits made in open editors since the last call.
-    pub fn idle(&self) -> Vec<EditorEdit> {
-        let mut side = self.side();
-        side.collect_garbage();
-        let mut out = Vec::new();
-        for (&(t, slot), e) in side.editors.iter_mut() {
-            for (id, v) in e.idle() {
-                out.push((t, slot, id, v));
-            }
-        }
-        out
+    /// Per-UI-frame housekeeping, the main-thread service point for every hosted plugin whether or
+    /// not its editor is open: drops retired instances, answers what the plugins asked of the host
+    /// (callbacks, restarts, parameter rescans and flushes, state changes: see
+    /// [`PluginService`]), and services the editors. Returns the parameter edits made in open
+    /// editors and the plugins whose state changed since the last call.
+    pub fn idle(&self) -> Idle {
+        self.side().idle()
+    }
+
+    /// Where to read a hosted plugin's own current parameter values from (see [`LiveParams`]).
+    pub fn live_params(&self) -> Arc<dyn LiveParams> {
+        let services: Arc<LiveServices> = Arc::clone(&self.side().services);
+        services
+    }
+
+    /// True while any third-party plugin is live, so the host keeps its service tick going.
+    pub fn has_plugins(&self) -> bool {
+        !self.side().services.lock().is_empty()
     }
 
     /// True when the plugin in this slot has its own editor.
@@ -852,6 +914,9 @@ impl Side {
                 }
                 if let Some(r) = plugin.state_reader() {
                     self.states.insert(key, r);
+                }
+                if let Some(svc) = plugin.service_handle() {
+                    self.services.lock().insert(key, svc);
                 }
                 if refused_state {
                     self.refused.insert(key);
@@ -1359,6 +1424,44 @@ mod tests {
         assert!(side.capture_states().is_empty());
         side.open_editor(k).unwrap();
         assert_eq!(side.capture_states(), vec![(TrackId(1), 0, b"defaults".to_vec())]);
+    }
+
+    /// A plugin whose service point counts its ticks and reports its state changed once.
+    struct Asking {
+        ticks: Arc<AtomicU32>,
+        told: bool,
+    }
+
+    impl PluginService for Asking {
+        fn service(&mut self) -> soundcraft_dsp::ServiceReport {
+            self.ticks.fetch_add(1, Ordering::SeqCst);
+            soundcraft_dsp::ServiceReport { values_changed: false, dirty: !std::mem::replace(&mut self.told, true) }
+        }
+        fn live_param(&mut self, id: &str) -> Option<f32> {
+            (id == "x").then_some(0.75)
+        }
+    }
+
+    #[test]
+    // Contract: the realtime host services every hosted plugin on its tick, whether or not it has
+    // an editor, reports the ones whose state changed, and reads their live parameter values.
+    fn idle_services_every_plugin_without_an_editor_and_reads_live_values() {
+        let mut side = Side::new(48_000.0, channel().1);
+        let (a, b) = ((TrackId(1), 0), (TrackId(2), 3));
+        let ticks = Arc::new(AtomicU32::new(0));
+        side.services.lock().insert(a, Box::new(Asking { ticks: Arc::clone(&ticks), told: false }));
+        side.services.lock().insert(b, Box::new(Asking { ticks: Arc::clone(&ticks), told: false }));
+        assert!(side.editors.is_empty(), "no editor is open anywhere");
+        let idle = side.idle();
+        assert_eq!(ticks.load(Ordering::SeqCst), 2, "both plugins were serviced");
+        assert_eq!(idle.dirty.len(), 2, "both reported a state change: {idle:?}");
+        assert!(side.idle().dirty.is_empty(), "reported once");
+        assert_eq!(ticks.load(Ordering::SeqCst), 4);
+        assert_eq!(side.services.live_value(a.0, a.1, "x"), Some(0.75));
+        assert_eq!(side.services.live_value(a.0, a.1, "y"), None);
+        assert_eq!(side.services.live_value(TrackId(9), 0, "x"), None, "no such plugin");
+        side.forget(a);
+        assert_eq!(side.services.live_value(a.0, a.1, "x"), None, "a forgotten plugin is no longer asked");
     }
 
     #[test]

@@ -139,6 +139,9 @@ pub struct Engine {
     /// The edit selection (range, tracks) before the last change, for Restore Last Selection.
     /// Kept out of the document so selecting never marks the session modified.
     pub last_selection: Option<(soundcraft_time::Range, Vec<TrackId>)>,
+    /// Where commands read a hosted plugin's own live parameter values from (set by the host that
+    /// runs the plugins; `None` without one). Not part of the document.
+    live: Option<Arc<dyn soundcraft_mix::LiveParams>>,
 }
 
 impl Default for Engine {
@@ -169,7 +172,18 @@ impl Engine {
             merge_hold: None,
             messages: Vec::new(),
             last_selection: None,
+            live: None,
         }
+    }
+
+    /// Gives commands the live values of the hosted plugins' parameters: an automation pass that
+    /// starts on a parameter nobody set begins at the plugin's own value, not its advertised default.
+    pub fn set_live_params(&mut self, live: Option<Arc<dyn soundcraft_mix::LiveParams>>) {
+        self.live = live;
+    }
+
+    pub fn live_params(&self) -> Option<Arc<dyn soundcraft_mix::LiveParams>> {
+        self.live.clone()
     }
 
     pub fn session(&self) -> &Session {

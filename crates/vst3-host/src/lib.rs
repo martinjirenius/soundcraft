@@ -35,9 +35,16 @@
 //! them into the session. Linux (X11) editor windows are not hosted yet: opening reports
 //! "unsupported".
 //!
-//! Not hosted yet: `IMessage`/`IAttributeList` creation through the host (plugins that need it
-//! for processor ↔ controller messaging may lose those messages), sidechain (aux buses are kept
-//! inactive) and 64-bit processing.
+//! The host creates `IMessage` and `IAttributeList` objects through `IHostApplication::createInstance`
+//! (processor ↔ controller messaging). What a plugin asks of the host (`restartComponent`:
+//! `kReloadComponent`, `kIoChanged`, `kLatencyChanged`, `kParamValuesChanged`, `kParamTitlesChanged`;
+//! `IComponentHandler2::setDirty`) is answered on the main thread by the plugin's
+//! [`soundcraft_dsp::PluginService`] ([`Plugin::service_handle`]), whether or not its editor is
+//! open. A restart re-configures and re-activates the plugin there, with the audio thread parked
+//! (see [`soundcraft_dsp::ParkGate`]: meanwhile `process` leaves its buffers as they are), and
+//! reads the latency after `setActive(true)`, as the SDK says.
+//!
+//! Not hosted yet: sidechain (aux buses are kept inactive) and 64-bit processing.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 

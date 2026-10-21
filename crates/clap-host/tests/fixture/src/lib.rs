@@ -20,6 +20,21 @@
 //!   no output and returns CLAP_PROCESS_CONTINUE (a plugin's output never contains a previous
 //!   block's audio: the host must hand back silence there).
 //!
+//! - `org.soundcraft.test.requests`: a gain effect (param 7, default 1) that asks things of the
+//!   host, to prove the host answers them. The trigger is a state blob `REQ` + one byte sent with
+//!   `Plugin::load_state` (main thread), or a value for param 20 "Request" (reaching the plugin
+//!   in `process`, i.e. on the audio thread): 1 `request_restart` (the plugin then changes its
+//!   parameter cookies and calls `params.rescan(ALL)` from `deactivate`, as the spec says it
+//!   must), 2 `request_callback`, 3 a program change (gain becomes 1.5, `params.rescan(VALUES)`),
+//!   4 `state.mark_dirty`, 5 `params.request_flush` (the next flush reports a GUI edit of the
+//!   gain to 0.25). Params 21 "Callbacks" and 22 "Activations" count `on_main_thread` calls and
+//!   `activate` calls, so a test reads them with the plugin's live values; every callback also
+//!   adds 0.01 of DC to its output, so a test hears that the host called back.
+//!
+//! Every fixture is strict about threads: `activate`, `deactivate` and `on_main_thread` must run
+//! on the thread that created the plugin (the main thread), and neither `activate`, `deactivate`
+//! nor `params.flush` may run while `process` runs on another thread. A wrong answer aborts.
+//!
 //! The gain plugin also implements `clap.state` (gain and mode as two little-endian f64s) and a
 //! floating-only `clap.gui` without a real window: showing it "edits" the gain to 0.25 in the GUI,
 //! reported as an output parameter event by the next `process`.
@@ -43,6 +58,8 @@ use clap_sys::plugin::*;
 use clap_sys::process::*;
 use clap_sys::version::CLAP_VERSION;
 use std::ffi::{CStr, c_char, c_void};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::ThreadId;
 
 struct Features<const N: usize>([*const c_char; N]);
 unsafe impl<const N: usize> Sync for Features<N> {}
@@ -71,6 +88,7 @@ static WIDE16_DESC: clap_plugin_descriptor = wide_desc(c"org.soundcraft.test.wid
 static WIDE17_DESC: clap_plugin_descriptor = wide_desc(c"org.soundcraft.test.wide17ports", c"Fixture Wide 17 ports");
 static WIDE65_DESC: clap_plugin_descriptor = wide_desc(c"org.soundcraft.test.wide65ch", c"Fixture Wide 65 channels");
 static FAULTY_DESC: clap_plugin_descriptor = wide_desc(c"org.soundcraft.test.faulty", c"Fixture Faulty");
+static REQUESTS_DESC: clap_plugin_descriptor = wide_desc(c"org.soundcraft.test.requests", c"Fixture Requests");
 
 static GAIN_DESC: clap_plugin_descriptor = clap_plugin_descriptor {
     clap_version: CLAP_VERSION,
@@ -114,6 +132,19 @@ struct Fx {
     gui_created: bool,
     gui_visible: bool,
     gui_edit_pending: bool,
+    /// The `org.soundcraft.test.requests` behaviour (see the module docs).
+    requests: bool,
+    /// The thread that created the plugin: the main thread.
+    main: ThreadId,
+    /// `process` is running (on any thread).
+    in_process: AtomicBool,
+    /// The gain's cookie is the alternative one (changed by a restart).
+    cookie_alt: bool,
+    rescan_all_on_deactivate: bool,
+    callbacks: u32,
+    activations: u32,
+    last_request: f64,
+    flush_edit: bool,
 }
 
 unsafe fn fx<'a>(p: *const clap_plugin) -> &'a mut Fx {
@@ -143,8 +174,15 @@ unsafe extern "C" fn destroy(p: *const clap_plugin) {
     drop(unsafe { Box::from_raw(data) });
 }
 
+fn on_main(f: &Fx, what: &str) {
+    assert_eq!(std::thread::current().id(), f.main, "{what} must run on the main thread");
+}
+
 unsafe extern "C" fn activate(p: *const clap_plugin, sr: f64, min: u32, max: u32) -> bool {
     let f = unsafe { fx(p) };
+    on_main(f, "activate");
+    assert!(!f.in_process.load(Ordering::SeqCst), "activate while process runs on another thread");
+    f.activations += 1;
     if f.active || !(sr > 0.0) || min == 0 || max < min {
         return false;
     }
@@ -154,8 +192,17 @@ unsafe extern "C" fn activate(p: *const clap_plugin, sr: f64, min: u32, max: u32
 
 unsafe extern "C" fn deactivate(p: *const clap_plugin) {
     let f = unsafe { fx(p) };
+    on_main(f, "deactivate");
+    assert!(!f.in_process.load(Ordering::SeqCst), "deactivate while process runs on another thread");
     assert!(!f.processing, "deactivate while processing");
     f.active = false;
+    if std::mem::take(&mut f.rescan_all_on_deactivate) {
+        // What a restart is for: the plugin may change its parameters while deactivated.
+        f.cookie_alt = !f.cookie_alt;
+        let host = unsafe { &*f.host };
+        let hp = unsafe { (host.get_extension.unwrap())(f.host, CLAP_EXT_PARAMS.as_ptr()) } as *const clap_host_params;
+        unsafe { (hp.as_ref().and_then(|h| h.rescan).expect("host params extension"))(f.host, CLAP_PARAM_RESCAN_ALL) };
+    }
 }
 
 unsafe extern "C" fn start_processing(p: *const clap_plugin) -> bool {
@@ -175,15 +222,45 @@ unsafe extern "C" fn reset(p: *const clap_plugin) {
 
 // Per-parameter cookies, handed out in `clap_param_info` and expected back in param events.
 static GAIN_COOKIE: u8 = 0;
+static GAIN_COOKIE_ALT: u8 = 0;
 static MODE_COOKIE: u8 = 0;
 static SECRET_COOKIE: u8 = 0;
 
-fn cookie_of(id: clap_id) -> *mut c_void {
+fn cookie_of(f: &Fx, id: clap_id) -> *mut c_void {
     match id {
+        7 if f.cookie_alt => std::ptr::addr_of!(GAIN_COOKIE_ALT) as *mut c_void,
         7 => std::ptr::addr_of!(GAIN_COOKIE) as *mut c_void,
         3 => std::ptr::addr_of!(MODE_COOKIE) as *mut c_void,
         9 => std::ptr::addr_of!(SECRET_COOKIE) as *mut c_void,
         _ => std::ptr::null_mut(),
+    }
+}
+
+/// What the `requests` plugin asks of the host (see the module docs).
+unsafe fn request(f: &mut Fx, kind: u8) {
+    let host = unsafe { &*f.host };
+    let ext = |id: &CStr| unsafe { (host.get_extension.unwrap())(f.host, id.as_ptr()) };
+    match kind {
+        1 => {
+            f.rescan_all_on_deactivate = true;
+            unsafe { (host.request_restart.unwrap())(f.host) };
+        }
+        2 => unsafe { (host.request_callback.unwrap())(f.host) },
+        3 => {
+            f.gain = 1.5;
+            let hp = unsafe { (ext(CLAP_EXT_PARAMS) as *const clap_host_params).as_ref() }.expect("host params extension");
+            unsafe { (hp.rescan.unwrap())(f.host, CLAP_PARAM_RESCAN_VALUES) };
+        }
+        4 => {
+            let hs = unsafe { (ext(CLAP_EXT_STATE) as *const clap_host_state).as_ref() }.expect("host state extension");
+            unsafe { (hs.mark_dirty.unwrap())(f.host) };
+        }
+        5 => {
+            f.flush_edit = true;
+            let hp = unsafe { (ext(CLAP_EXT_PARAMS) as *const clap_host_params).as_ref() }.expect("host params extension");
+            unsafe { (hp.request_flush.unwrap())(f.host) };
+        }
+        _ => {}
     }
 }
 
@@ -195,12 +272,16 @@ fn apply(f: &mut Fx, h: &clap_event_header) {
         CLAP_EVENT_PARAM_VALUE => {
             let e = unsafe { &*(h as *const clap_event_header as *const clap_event_param_value) };
             // Like JUCE plugins, trust the host to echo the cookie: a wrong one would be dereferenced, here it is ignored.
-            if e.cookie != cookie_of(e.param_id) {
+            if e.cookie != cookie_of(f, e.param_id) {
                 return;
             }
             match e.param_id {
                 7 => f.gain = e.value,
                 3 => f.mode = e.value,
+                20 if f.requests => {
+                    f.last_request = e.value;
+                    unsafe { request(f, e.value as u8) };
+                }
                 _ => {}
             }
         }
@@ -274,6 +355,14 @@ unsafe fn faulty_process(pr: &clap_process) -> clap_process_status {
 }
 
 unsafe extern "C" fn process(p: *const clap_plugin, pr: *const clap_process) -> clap_process_status {
+    let f = unsafe { fx(p) };
+    f.in_process.store(true, Ordering::SeqCst);
+    let r = unsafe { process_block(p, pr) };
+    f.in_process.store(false, Ordering::SeqCst);
+    r
+}
+
+unsafe fn process_block(p: *const clap_plugin, pr: *const clap_process) -> clap_process_status {
     let f = unsafe { fx(p) };
     let pr = unsafe { &*pr };
     assert!(f.processing, "process while not processing");
@@ -371,7 +460,7 @@ unsafe extern "C" fn process(p: *const clap_plugin, pr: *const clap_process) -> 
             let v = match input {
                 Some(inp) => {
                     let x = unsafe { *(*inp.data32.add(c.min(inp.channel_count as usize - 1))).add(i) };
-                    x * f.gain as f32
+                    x * f.gain as f32 + if f.requests { f.callbacks as f32 * 0.01 } else { 0.0 }
                 }
                 None => (f.level * f.gain) as f32,
             };
@@ -384,7 +473,14 @@ unsafe extern "C" fn process(p: *const clap_plugin, pr: *const clap_process) -> 
 // ---- extensions ----
 
 unsafe extern "C" fn params_count(p: *const clap_plugin) -> u32 {
-    if unsafe { fx(p) }.synth { 1 } else { 3 }
+    let f = unsafe { fx(p) };
+    if f.synth {
+        1
+    } else if f.requests {
+        4
+    } else {
+        3
+    }
 }
 
 fn write_name(dst: &mut [c_char], s: &CStr) {
@@ -397,17 +493,21 @@ unsafe extern "C" fn params_get_info(p: *const clap_plugin, index: u32, info: *m
     let info = unsafe { &mut *info };
     // The synth's one param is its output gain: it really starts at 1.0, but advertises default 0.0
     // like Surge XT, so a host that writes advertised defaults silences it.
-    let synth = unsafe { fx(p) }.synth;
+    let f = unsafe { fx(p) };
+    let synth = f.synth;
     let (id, name, flags, min, max, def): (clap_id, &CStr, u32, f64, f64, f64) = match index {
+        1 if f.requests => (20, c"Request", CLAP_PARAM_IS_STEPPED, 0.0, 9.0, 0.0),
+        2 if f.requests => (21, c"Callbacks", CLAP_PARAM_IS_AUTOMATABLE, 0.0, 1000.0, 0.0),
+        3 if f.requests => (22, c"Activations", CLAP_PARAM_IS_AUTOMATABLE, 0.0, 1000.0, 0.0),
         0 if synth => (7, c"Volume", CLAP_PARAM_IS_AUTOMATABLE, 0.0, 2.0, 0.0),
         0 => (7, c"Gain", CLAP_PARAM_IS_AUTOMATABLE, 0.0, 2.0, 1.0),
-        1 => (3, c"Mode", CLAP_PARAM_IS_STEPPED | CLAP_PARAM_IS_ENUM, 0.0, 2.0, 0.0),
-        2 => (9, c"Secret", CLAP_PARAM_IS_HIDDEN, 0.0, 1.0, 0.0),
+        1 if !f.requests => (3, c"Mode", CLAP_PARAM_IS_STEPPED | CLAP_PARAM_IS_ENUM, 0.0, 2.0, 0.0),
+        2 if !f.requests => (9, c"Secret", CLAP_PARAM_IS_HIDDEN, 0.0, 1.0, 0.0),
         _ => return false,
     };
     info.id = id;
     info.flags = flags;
-    info.cookie = cookie_of(id);
+    info.cookie = cookie_of(f, id);
     write_name(&mut info.name, name);
     write_name(&mut info.module, c"");
     info.min_value = min;
@@ -422,6 +522,9 @@ unsafe extern "C" fn params_get_value(p: *const clap_plugin, id: clap_id, out: *
         7 => f.gain,
         3 => f.mode,
         9 => 0.0,
+        20 if f.requests => f.last_request,
+        21 if f.requests => f64::from(f.callbacks),
+        22 if f.requests => f64::from(f.activations),
         _ => return false,
     };
     unsafe { *out = v };
@@ -440,8 +543,30 @@ unsafe extern "C" fn params_value_to_text(_p: *const clap_plugin, id: clap_id, v
     true
 }
 
-unsafe extern "C" fn params_flush(p: *const clap_plugin, inp: *const clap_input_events, _out: *const clap_output_events) {
+unsafe extern "C" fn params_flush(p: *const clap_plugin, inp: *const clap_input_events, out: *const clap_output_events) {
     let f = unsafe { fx(p) };
+    assert!(!f.in_process.load(Ordering::SeqCst), "params.flush while process runs on another thread");
+    if std::mem::take(&mut f.flush_edit) {
+        // The edit the plugin's GUI made while the plugin was not processing.
+        f.gain = 0.25;
+        let e = clap_event_param_value {
+            header: clap_event_header {
+                size: std::mem::size_of::<clap_event_param_value>() as u32,
+                time: 0,
+                space_id: CLAP_CORE_EVENT_SPACE_ID,
+                type_: CLAP_EVENT_PARAM_VALUE,
+                flags: 0,
+            },
+            param_id: 7,
+            cookie: std::ptr::null_mut(),
+            note_id: -1,
+            port_index: -1,
+            channel: -1,
+            key: -1,
+            value: 0.25,
+        };
+        assert!(unsafe { ((*out).try_push.unwrap())(out, &e.header) });
+    }
     let ev = unsafe { &*inp };
     let n = unsafe { (ev.size.unwrap())(inp) };
     for i in 0..n {
@@ -545,6 +670,11 @@ unsafe extern "C" fn state_load(p: *const clap_plugin, stream: *const clap_istre
             break;
         }
     }
+    if f.requests && got == 4 && &bytes[..3] == b"REQ" {
+        // The test's trigger: make the request in the blob, from the calling (main) thread.
+        unsafe { request(f, bytes[3]) };
+        return true;
+    }
     if got != 16 {
         return false;
     }
@@ -644,12 +774,16 @@ unsafe extern "C" fn get_extension(p: *const clap_plugin, id: *const c_char) -> 
     }
 }
 
-unsafe extern "C" fn on_main_thread(_p: *const clap_plugin) {}
+unsafe extern "C" fn on_main_thread(p: *const clap_plugin) {
+    let f = unsafe { fx(p) };
+    on_main(f, "on_main_thread");
+    f.callbacks += 1;
+}
 
 // ---- factory + entry ----
 
 unsafe extern "C" fn factory_count(_f: *const clap_plugin_factory) -> u32 {
-    6
+    7
 }
 
 unsafe extern "C" fn factory_desc(_f: *const clap_plugin_factory, i: u32) -> *const clap_plugin_descriptor {
@@ -660,6 +794,7 @@ unsafe extern "C" fn factory_desc(_f: *const clap_plugin_factory, i: u32) -> *co
         3 => &WIDE17_DESC,
         4 => &WIDE65_DESC,
         5 => &FAULTY_DESC,
+        6 => &REQUESTS_DESC,
         _ => std::ptr::null(),
     }
 }
@@ -678,6 +813,8 @@ unsafe extern "C" fn factory_create(_f: *const clap_plugin_factory, host: *const
         (&WIDE65_DESC as *const _, false, Some((1, 65)))
     } else if id == c"org.soundcraft.test.faulty" {
         (&FAULTY_DESC as *const _, false, None)
+    } else if id == c"org.soundcraft.test.requests" {
+        (&REQUESTS_DESC as *const _, false, None)
     } else {
         return std::ptr::null();
     };
@@ -708,6 +845,15 @@ unsafe extern "C" fn factory_create(_f: *const clap_plugin_factory, host: *const
         gui_created: false,
         gui_visible: false,
         gui_edit_pending: false,
+        requests: id == c"org.soundcraft.test.requests",
+        main: std::thread::current().id(),
+        in_process: AtomicBool::new(false),
+        cookie_alt: false,
+        rescan_all_on_deactivate: false,
+        callbacks: 0,
+        activations: 0,
+        last_request: 0.0,
+        flush_edit: false,
     });
     let raw = Box::into_raw(b);
     unsafe {

@@ -25,7 +25,8 @@ use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_host_latency, clap_plugin_la
 use clap_sys::ext::log::{CLAP_EXT_LOG, CLAP_LOG_ERROR, CLAP_LOG_FATAL, CLAP_LOG_WARNING, clap_host_log, clap_log_severity};
 use clap_sys::ext::note_ports::{CLAP_EXT_NOTE_PORTS, clap_note_port_info, clap_plugin_note_ports};
 use clap_sys::ext::params::{
-    CLAP_EXT_PARAMS, clap_host_params, clap_param_clear_flags, clap_param_info, clap_param_rescan_flags, clap_plugin_params,
+    CLAP_EXT_PARAMS, CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_INFO, clap_host_params, clap_param_clear_flags, clap_param_info,
+    clap_param_rescan_flags, clap_plugin_params,
 };
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state, clap_plugin_state};
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
@@ -36,12 +37,13 @@ use clap_sys::plugin::clap_plugin;
 use clap_sys::process::{CLAP_PROCESS_ERROR, clap_process};
 use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::version::{CLAP_VERSION, clap_version_is_compatible};
-use soundcraft_dsp::Transport;
+use soundcraft_dsp::{ParkGate, Transport};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::Duration;
 
 /// Most plugins one factory may report (hostile-input cap).
 const MAX_PLUGINS_PER_FACTORY: u32 = 1024;
@@ -253,12 +255,8 @@ impl Bundle {
             gui: Arc::new(GuiLink::default()),
             raw: Vec::with_capacity(EVENT_CAP),
             out_params: Vec::with_capacity(EVENT_CAP),
-            cookies: Vec::new(),
             dropped_in: 0,
             dropped_out: 0,
-            active: false,
-            processing: false,
-            max_frames: 0,
             created: true,
             _host: host,
             state,
@@ -276,14 +274,25 @@ impl Bundle {
             return Err(err("plugin init failed"));
         }
         inst.params = inst.extension::<clap_plugin_params>(CLAP_EXT_PARAMS);
-        inst.read_cookies();
+        inst.start_cookies();
         inst.ports = inst.extension::<clap_plugin_audio_ports>(CLAP_EXT_AUDIO_PORTS);
         inst.latency = inst.extension::<clap_plugin_latency>(CLAP_EXT_LATENCY);
         inst.notes = inst.extension::<clap_plugin_note_ports>(CLAP_EXT_NOTE_PORTS);
         inst.state_ext = inst.extension::<clap_plugin_state>(CLAP_EXT_STATE);
         let gui = inst.extension::<clap_plugin_gui>(CLAP_EXT_GUI);
         inst.gui = Arc::new(GuiLink {
-            inner: Mutex::new(GuiInner { plugin, gui, state: inst.state_ext, alive: true, created: false, visible: false, window: None }),
+            inner: Mutex::new(GuiInner {
+                plugin,
+                gui,
+                state: inst.state_ext,
+                params: inst.params,
+                ports: inst.ports,
+                latency: inst.latency,
+                alive: true,
+                created: false,
+                visible: false,
+                window: None,
+            }),
             host: Arc::clone(&inst.state),
         });
         Ok(inst)
@@ -306,11 +315,42 @@ impl Drop for Bundle {
 
 /// Flags the plugin raises through the host callbacks (any thread).
 pub(crate) struct HostState {
+    /// `request_restart` (and `latency.changed`): the plugin is to be deactivated and
+    /// re-activated by the main-thread service.
     pub restart: AtomicBool,
+    /// `request_process`. The host calls `process` every block, so there is nothing to do.
     pub process: AtomicBool,
+    /// `request_callback`: `on_main_thread` is due.
     pub callback: AtomicBool,
     pub latency_changed: AtomicBool,
-    pub params_rescan: AtomicBool,
+    /// `params.rescan` flags raised since the service last ran (OR-ed).
+    pub rescan: AtomicU32,
+    /// `params.request_flush`: the plugin wants a flush while it is not processing.
+    pub flush: AtomicBool,
+    /// How the audio thread and the main-thread service share the plugin (see [`ParkGate`]).
+    pub gate: Arc<ParkGate>,
+    /// The plugin is activated / in the processing state. Changed under the gate only (or by the
+    /// thread that owns the instance while nothing else runs).
+    pub active: AtomicBool,
+    pub processing: AtomicBool,
+    /// What the plugin was last activated with, for a restart.
+    pub sample_rate: AtomicU64,
+    pub max_frames: AtomicU32,
+    /// Latency read after the last activation (`clap.latency` is read while active).
+    pub latency: AtomicU32,
+    /// Activation or processing failed (set by the audio thread and the service, cleared by `prepare`).
+    pub failed: AtomicBool,
+    /// The first `process` failure since the service last reported it (a [`Fault`] code; 0 = none).
+    pub fault: AtomicU8,
+    /// `process` calls so far: the service tells a processing plugin from an idle one by it.
+    pub blocks: AtomicU64,
+    /// `blocks` at the last service tick (main thread only).
+    pub blocks_seen: AtomicU64,
+    /// A signature of the audio port layout the host's buffers were built for.
+    pub layout: AtomicU64,
+    /// Each parameter's cookie from `clap_param_info`, sorted by id; echoed back in param events
+    /// (JUCE plugins dereference it). The ids are fixed at instantiate; a rescan refreshes the values.
+    pub cookies: OnceLock<Box<[(u32, AtomicPtr<c_void>)]>>,
     /// `clap_host_state.mark_dirty`.
     pub dirty: AtomicBool,
     /// `clap_host_gui` requests, serviced by the editor's `idle` on the main thread.
@@ -332,7 +372,20 @@ impl Default for HostState {
             process: AtomicBool::new(false),
             callback: AtomicBool::new(false),
             latency_changed: AtomicBool::new(false),
-            params_rescan: AtomicBool::new(false),
+            rescan: AtomicU32::new(0),
+            flush: AtomicBool::new(false),
+            gate: Arc::new(ParkGate::default()),
+            active: AtomicBool::new(false),
+            processing: AtomicBool::new(false),
+            sample_rate: AtomicU64::new(0),
+            max_frames: AtomicU32::new(0),
+            latency: AtomicU32::new(0),
+            failed: AtomicBool::new(false),
+            fault: AtomicU8::new(0),
+            blocks: AtomicU64::new(0),
+            blocks_seen: AtomicU64::new(0),
+            layout: AtomicU64::new(0),
+            cookies: OnceLock::new(),
             dirty: AtomicBool::new(false),
             gui_closed: AtomicBool::new(false),
             gui_destroyed: AtomicBool::new(false),
@@ -387,10 +440,10 @@ unsafe extern "C" fn host_log(_host: *const clap_host, severity: clap_log_severi
     }
 }
 
-unsafe extern "C" fn host_params_rescan(host: *const clap_host, _flags: clap_param_rescan_flags) {
+unsafe extern "C" fn host_params_rescan(host: *const clap_host, flags: clap_param_rescan_flags) {
     // SAFETY: the plugin passes back the host pointer we gave it.
     if let Some(s) = unsafe { state(host) } {
-        s.params_rescan.store(true, Ordering::Relaxed);
+        s.rescan.fetch_or(flags.max(1), Ordering::Relaxed);
     }
 }
 
@@ -399,7 +452,7 @@ unsafe extern "C" fn host_params_clear(_host: *const clap_host, _id: clap_id, _f
 unsafe extern "C" fn host_params_request_flush(host: *const clap_host) {
     // SAFETY: the plugin passes back the host pointer we gave it.
     if let Some(s) = unsafe { state(host) } {
-        s.process.store(true, Ordering::Relaxed);
+        s.flush.store(true, Ordering::Relaxed);
     }
 }
 
@@ -556,7 +609,7 @@ impl RawEvent {
         }
     }
 
-    fn from_event(e: &Event, offset: u32, cookies: &[(u32, *mut c_void)]) -> RawEvent {
+    fn from_event(e: &Event, offset: u32, cookies: &[(u32, AtomicPtr<c_void>)]) -> RawEvent {
         let header = |size: usize, type_: u16, time: u32| clap_event_header {
             size: u32::try_from(size).unwrap_or(u32::MAX),
             time: time.saturating_sub(offset),
@@ -568,7 +621,11 @@ impl RawEvent {
             Event::Param { time, id, value } => RawEvent::Param(clap_event_param_value {
                 header: header(size_of::<clap_event_param_value>(), CLAP_EVENT_PARAM_VALUE, time),
                 param_id: id,
-                cookie: cookies.binary_search_by_key(&id, |c| c.0).ok().and_then(|i| cookies.get(i)).map_or(std::ptr::null_mut(), |c| c.1),
+                cookie: cookies
+                    .binary_search_by_key(&id, |c| c.0)
+                    .ok()
+                    .and_then(|i| cookies.get(i))
+                    .map_or(std::ptr::null_mut(), |c| c.1.load(Ordering::Acquire)),
                 note_id: -1,
                 port_index: -1,
                 channel: -1,
@@ -766,6 +823,9 @@ struct GuiInner {
     plugin: *const clap_plugin,
     gui: *const clap_plugin_gui,
     state: *const clap_plugin_state,
+    params: *const clap_plugin_params,
+    ports: *const clap_plugin_audio_ports,
+    latency: *const clap_plugin_latency,
     /// The plugin instance exists (cleared by `Instance::drop` before it destroys the plugin).
     alive: bool,
     created: bool,
@@ -773,6 +833,17 @@ struct GuiInner {
     /// The host window of an embedded editor (`None` for floating editors).
     window: Option<hostwin::HostWindow>,
 }
+
+/// What [`GuiLink::service`] found that the caller reports on.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Serviced {
+    pub values_changed: bool,
+    pub dirty: bool,
+}
+
+/// Longest the main thread waits for the audio thread to leave the plugin before it tries again
+/// on its next service tick.
+const PARK_LIMIT: Duration = Duration::from_millis(50);
 
 /// The link between an instance and its editor and state handles. The instance may process on
 /// the audio thread while the editor is driven and the state saved from the main thread: CLAP
@@ -792,6 +863,9 @@ impl Default for GuiLink {
                 plugin: std::ptr::null(),
                 gui: std::ptr::null(),
                 state: std::ptr::null(),
+                params: std::ptr::null(),
+                ports: std::ptr::null(),
+                latency: std::ptr::null(),
                 alive: false,
                 created: false,
                 visible: false,
@@ -814,10 +888,6 @@ impl GuiLink {
     pub fn available(&self) -> bool {
         let g = self.lock();
         g.alive && !g.gui.is_null()
-    }
-
-    pub fn host(&self) -> &HostState {
-        &self.host
     }
 
     fn vt(g: &GuiInner) -> Option<clap_plugin_gui> {
@@ -1041,6 +1111,141 @@ impl GuiLink {
         out
     }
 
+    /// The plugin's own current value of a parameter (`clap_plugin_params.get_value`, main thread;
+    /// `None` without the extension, for an unknown id, or once the plugin is gone). "Main
+    /// thread" is whichever thread owns the plugin's main-thread calls: the UI thread, or the
+    /// render thread of an engine that owns its plugins.
+    pub fn param_value(&self, id: u32) -> Option<f64> {
+        let g = self.lock();
+        if !g.alive {
+            return None;
+        }
+        // SAFETY: the extension pointer, when non-null, points to a static vtable in the plugin,
+        // which is alive (under the lock, `alive`).
+        let get = unsafe { g.params.as_ref() }?.get_value?;
+        let mut v = 0.0f64;
+        // SAFETY: live plugin, main thread; `v` is writable.
+        (unsafe { get(g.plugin, id, &mut v) } && v.is_finite()).then_some(v)
+    }
+
+    /// Answers what the plugin asked of the host since the last call, on the main thread, whether
+    /// or not its editor is open: `request_callback` (`on_main_thread`), `request_restart` and
+    /// `latency.changed` (deactivate and re-activate, the audio thread parked meanwhile),
+    /// `params.rescan` (cookies and values re-read), `params.request_flush` (a flush while the
+    /// plugin is not processing) and `state.mark_dirty`. A process failure the audio thread
+    /// recorded is logged here, with its reason. `id` names the plugin in the log.
+    pub fn service(&self, id: &str) -> Serviced {
+        let mut out = Serviced::default();
+        let g = self.lock();
+        if !g.alive {
+            return out;
+        }
+        let st = &*self.host;
+        let raw = Raw { plugin: g.plugin, params: g.params, ports: g.ports, latency: g.latency };
+        let blocks = st.blocks.load(Ordering::Relaxed);
+        let processing = blocks != st.blocks_seen.swap(blocks, Ordering::Relaxed);
+        if st.callback.swap(false, Ordering::Relaxed)
+            && let Some(f) = raw.vt().on_main_thread
+        {
+            // SAFETY: live plugin (under the lock, `alive`), main thread, asked for by `request_callback`.
+            unsafe { f(g.plugin) };
+        }
+        // `request_process`: every block is processed anyway, so it is answered already.
+        st.process.store(false, Ordering::Relaxed);
+        let rescan = st.rescan.swap(0, Ordering::Relaxed);
+        if rescan != 0 {
+            out.values_changed = true;
+            if rescan & (CLAP_PARAM_RESCAN_ALL | CLAP_PARAM_RESCAN_INFO) != 0 && !raw.refresh_cookies(st) {
+                log::warn!("{id}: the plugin changed its set of parameters; SoundCraft keeps the list it read when the plugin loaded");
+            }
+        }
+        if st.restart.swap(false, Ordering::Relaxed) | st.latency_changed.swap(false, Ordering::Relaxed) {
+            self.restart(&raw, id);
+            out.values_changed = true;
+        }
+        // A flush is for a plugin that is not processing: while blocks run, its output events
+        // come with them, and the request waits for the first tick without a block.
+        if !processing && st.flush.swap(false, Ordering::Relaxed) {
+            self.flush(&raw, id);
+        }
+        out.dirty = st.dirty.swap(false, Ordering::Relaxed);
+        if let Some(f) = Fault::from_code(st.fault.swap(0, Ordering::AcqRel)) {
+            log::warn!("{id}: CLAP processing failed: {f}");
+        }
+        out
+    }
+
+    /// Deactivates and re-activates the plugin as it asked (`request_restart`), here on the main
+    /// thread with the audio thread parked: for the blocks that takes, the plugin counts as
+    /// inactive and its buffers are left untouched. Latency and the port layout are read after
+    /// the plugin is active again. A layout the host's buffers do not fit leaves the plugin
+    /// deactivated and failed (it takes a `prepare` to size new buffers).
+    fn restart(&self, raw: &Raw, id: &str) {
+        let st = &*self.host;
+        let rate = f64::from_bits(st.sample_rate.load(Ordering::Relaxed));
+        let max = st.max_frames.load(Ordering::Relaxed);
+        if rate.is_nan() || rate <= 0.0 || max == 0 {
+            // Never activated (`prepare` failed or has not run): nothing to restart.
+            return;
+        }
+        let Some(_parked) = st.gate.park(PARK_LIMIT) else {
+            // The audio thread is inside the plugin longer than we wait: try again next tick.
+            st.restart.store(true, Ordering::Relaxed);
+            return;
+        };
+        raw.deactivate(st);
+        let result = raw.activate(st, rate, 1, max).and_then(|()| match raw.layout() {
+            Ok(sig) if sig == st.layout.load(Ordering::Acquire) => Ok(()),
+            Ok(_) => Err(ClapError::Process("the audio port layout changed; it applies at the next prepare".into())),
+            Err(e) => Err(e),
+        });
+        match result {
+            Ok(()) => {
+                st.latency.store(raw.latency(), Ordering::Release);
+                st.failed.store(false, Ordering::Release);
+            }
+            Err(e) => {
+                raw.deactivate(st);
+                st.failed.store(true, Ordering::Release);
+                log::warn!("{id}: restart failed: {e}");
+            }
+        }
+    }
+
+    /// `clap_plugin_params.flush` with no input, for a plugin that is not processing and asked
+    /// for one: its output events (edits made in its GUI) are queued for the UI as `process` would.
+    fn flush(&self, raw: &Raw, id: &str) {
+        let st = &*self.host;
+        // SAFETY: the extension pointer, when non-null, points to a static vtable in the live plugin.
+        let Some(flush) = (unsafe { raw.params.as_ref() }).and_then(|p| p.flush) else { return };
+        let Some(_parked) = st.gate.park(PARK_LIMIT) else {
+            st.flush.store(true, Ordering::Relaxed);
+            return;
+        };
+        let empty: Vec<RawEvent> = Vec::new();
+        let in_events = clap_input_events {
+            ctx: (&empty as *const Vec<RawEvent>).cast_mut().cast::<c_void>(),
+            size: Some(in_events_size),
+            get: Some(in_events_get),
+        };
+        let mut params: Vec<(u32, f64)> = Vec::with_capacity(EDIT_CAP);
+        let mut refused = 0usize;
+        let mut sink = OutSink { params: &mut params, refused: &mut refused };
+        let out_events = clap_output_events { ctx: (&mut sink as *mut OutSink<'_>).cast::<c_void>(), try_push: Some(out_events_try_push) };
+        // SAFETY: live plugin, audio thread parked (so this is the only caller); the lists and
+        // their contexts live on this frame for the call.
+        unsafe { flush(raw.plugin, &in_events, &out_events) };
+        if refused > 0 {
+            log::warn!("{id}: refused {refused} output event(s) of a flush, the host event queue was full");
+        }
+        let mut edits = st.edits.lock().unwrap_or_else(PoisonError::into_inner);
+        for e in params {
+            if edits.len() < edits.capacity() {
+                edits.push(e);
+            }
+        }
+    }
+
     /// Called by the instance before it destroys the plugin.
     fn kill(&self) {
         let mut g = self.lock();
@@ -1150,6 +1355,186 @@ pub(crate) struct NotePort {
     pub preferred: u32,
 }
 
+/// Why one `process` call failed. Plain data (its `u8` code goes in `HostState::fault`): the audio
+/// thread records it without allocating, and the main-thread service logs the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum Fault {
+    NotActive = 1,
+    BlockTooLarge,
+    StartProcessing,
+    NoProcess,
+    PluginError,
+}
+
+impl Fault {
+    pub fn from_code(c: u8) -> Option<Fault> {
+        [Fault::NotActive, Fault::BlockTooLarge, Fault::StartProcessing, Fault::NoProcess, Fault::PluginError].into_iter().find(|f| *f as u8 == c)
+    }
+}
+
+impl std::fmt::Display for Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Fault::NotActive => "the plugin is not active",
+            Fault::BlockTooLarge => "block larger than the activated size",
+            Fault::StartProcessing => "start_processing failed",
+            Fault::NoProcess => "the plugin has no process function",
+            Fault::PluginError => "the plugin reported a processing error",
+        })
+    }
+}
+
+/// A signature of an audio port layout (channel counts and main flags, both directions).
+pub(crate) fn layout_sig(ins: &[PortInfo], outs: &[PortInfo]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for (dir, ports) in [(1u64, ins), (2, outs)] {
+        for x in std::iter::once(dir).chain(ports.iter().flat_map(|p| [u64::from(p.channels), u64::from(p.main)])) {
+            h = (h ^ x).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// The plugin's pointers, for the calls both the instance and the main-thread service make.
+///
+/// SAFETY contract (all methods): a `Raw` is only made for a live plugin and only used while it
+/// is alive: by the owning `Instance`, or under the `GuiLink` lock while `alive` is set.
+#[derive(Clone, Copy)]
+pub(crate) struct Raw {
+    plugin: *const clap_plugin,
+    params: *const clap_plugin_params,
+    ports: *const clap_plugin_audio_ports,
+    latency: *const clap_plugin_latency,
+}
+
+impl Raw {
+    fn vt(&self) -> clap_plugin {
+        // SAFETY: see the contract above; the plugin pointer is non-null.
+        unsafe { *self.plugin }
+    }
+
+    /// The raw `clap_param_info` of every parameter the plugin describes (empty without `clap.params`).
+    fn param_infos(&self) -> Vec<clap_param_info> {
+        // SAFETY: the extension pointer, when non-null, points to a static vtable in the plugin.
+        let Some(p) = (unsafe { self.params.as_ref() }) else { return Vec::new() };
+        let (Some(count), Some(get_info)) = (p.count, p.get_info) else { return Vec::new() };
+        // SAFETY: vtable call with the instance it belongs to.
+        let n = unsafe { count(self.plugin) }.min(MAX_PARAMS);
+        let mut out = Vec::new();
+        for i in 0..n {
+            // SAFETY: `clap_param_info` is plain data (integers, floats, char arrays, a nullable
+            // pointer); all-zero is a valid value.
+            let mut info: clap_param_info = unsafe { std::mem::zeroed() };
+            // SAFETY: index below the count; `info` is a valid, writable struct.
+            if !unsafe { get_info(self.plugin, i, &mut info) } {
+                continue;
+            }
+            out.push(info);
+        }
+        out
+    }
+
+    /// Re-reads each known parameter's cookie (a params rescan may change them) and returns
+    /// whether the plugin's set of parameter ids still is the one the host described.
+    fn refresh_cookies(&self, st: &HostState) -> bool {
+        let Some(known) = st.cookies.get() else { return true };
+        let infos = self.param_infos();
+        for info in &infos {
+            if let Ok(i) = known.binary_search_by_key(&info.id, |c| c.0)
+                && let Some(c) = known.get(i)
+            {
+                c.1.store(info.cookie, Ordering::Release);
+            }
+        }
+        let mut now: Vec<u32> = infos.iter().map(|i| i.id).collect();
+        now.sort_unstable();
+        now.iter().copied().eq(known.iter().map(|c| c.0))
+    }
+
+    /// The plugin's audio ports in one direction. A layout beyond `MAX_PORTS` ports or
+    /// `MAX_PORT_CHANNELS` channels per port is an error: we never hand a plugin fewer ports or
+    /// channels than it advertised.
+    fn audio_ports(&self, is_input: bool) -> Result<Vec<PortInfo>, ClapError> {
+        // SAFETY: see `params`.
+        let Some(p) = (unsafe { self.ports.as_ref() }) else { return Ok(Vec::new()) };
+        let (Some(count), Some(get)) = (p.count, p.get) else { return Ok(Vec::new()) };
+        let dir = if is_input { "input" } else { "output" };
+        // SAFETY: vtable call with its instance.
+        let n = unsafe { count(self.plugin, is_input) };
+        if n > MAX_PORTS {
+            return Err(ClapError::Process(format!("{n} audio {dir} ports (at most {MAX_PORTS} supported)")));
+        }
+        let mut out = Vec::new();
+        for i in 0..n {
+            // SAFETY: plain data; all-zero (null port_type pointer) is valid.
+            let mut info: clap_audio_port_info = unsafe { std::mem::zeroed() };
+            // SAFETY: index below the count; `info` is writable.
+            if unsafe { get(self.plugin, i, is_input, &mut info) } {
+                if info.channel_count > MAX_PORT_CHANNELS {
+                    return Err(ClapError::Process(format!(
+                        "audio {dir} port {i} has {} channels (at most {MAX_PORT_CHANNELS} supported)",
+                        info.channel_count
+                    )));
+                }
+                out.push(PortInfo { channels: info.channel_count, main: info.flags & CLAP_AUDIO_PORT_IS_MAIN != 0 });
+            } else {
+                // Keep port indices aligned: an unreadable port still needs a (silent) buffer slot.
+                out.push(PortInfo { channels: 0, main: false });
+            }
+        }
+        Ok(out)
+    }
+
+    /// The signature of both directions' ports.
+    fn layout(&self) -> Result<u64, ClapError> {
+        Ok(layout_sig(&self.audio_ports(true)?, &self.audio_ports(false)?))
+    }
+
+    fn latency(&self) -> u32 {
+        // SAFETY: see `params`.
+        match unsafe { self.latency.as_ref() }.and_then(|l| l.get) {
+            // SAFETY: valid instance.
+            Some(f) => unsafe { f(self.plugin) },
+            None => 0,
+        }
+    }
+
+    fn stop_processing(&self, st: &HostState) {
+        if st.processing.swap(false, Ordering::AcqRel)
+            && let Some(f) = self.vt().stop_processing
+        {
+            // SAFETY: valid instance in the processing state.
+            unsafe { f(self.plugin) };
+        }
+    }
+
+    fn deactivate(&self, st: &HostState) {
+        self.stop_processing(st);
+        if st.active.swap(false, Ordering::AcqRel)
+            && let Some(f) = self.vt().deactivate
+        {
+            // SAFETY: valid, active instance.
+            unsafe { f(self.plugin) };
+        }
+    }
+
+    /// Activates a deactivated plugin, refreshes its cookies and remembers what it was activated
+    /// with (a restart repeats it).
+    fn activate(&self, st: &HostState, sample_rate: f64, min_frames: u32, max_frames: u32) -> Result<(), ClapError> {
+        self.refresh_cookies(st);
+        let f = self.vt().activate.ok_or_else(|| ClapError::Process("plugin has no activate".into()))?;
+        // SAFETY: valid, inactive instance; arguments are sane (checked by the caller).
+        if !unsafe { f(self.plugin, sample_rate, min_frames, max_frames) } {
+            return Err(ClapError::Process("activate failed".into()));
+        }
+        st.sample_rate.store(sample_rate.to_bits(), Ordering::Relaxed);
+        st.max_frames.store(max_frames, Ordering::Relaxed);
+        st.active.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
 /// A live plugin instance plus the host struct it was created with.
 pub(crate) struct Instance {
     plugin: *const clap_plugin,
@@ -1162,15 +1547,10 @@ pub(crate) struct Instance {
     raw: Vec<RawEvent>,
     /// Parameter values the plugin reported through output events in the current `process`.
     out_params: Vec<(u32, f64)>,
-    /// Each parameter's cookie from `clap_param_info`, sorted by id; echoed back in param events (JUCE plugins dereference it).
-    cookies: Vec<(u32, *mut c_void)>,
     /// Input events not handed to the plugin because the event list was full (see `take_dropped`).
     dropped_in: usize,
     /// Output parameter events the host refused because `out_params` was full (see `take_dropped`).
     dropped_out: usize,
-    active: bool,
-    processing: bool,
-    max_frames: usize,
     created: bool,
     // Field order matters for drop: the plugin is destroyed in `Drop::drop` first; then the host
     // struct and its state, then the bundle (which keeps the code mapped) go.
@@ -1208,6 +1588,11 @@ impl Instance {
         self.gui.available().then(|| Arc::clone(&self.gui))
     }
 
+    /// The link the main-thread service works through (it exists for every plugin).
+    pub fn link(&self) -> Arc<GuiLink> {
+        Arc::clone(&self.gui)
+    }
+
     /// The same link, for state handles (`None` when the plugin has no `clap.state`).
     pub fn state_link(&self) -> Option<Arc<GuiLink>> {
         (!self.state_ext.is_null()).then(|| Arc::clone(&self.gui))
@@ -1233,33 +1618,21 @@ impl Instance {
         }
     }
 
-    /// Re-reads every parameter's cookie. Cookies only change through a params rescan, so this runs
-    /// at instantiate and on each activate (which is always made while deactivated).
-    fn read_cookies(&mut self) {
-        let mut cookies: Vec<(u32, *mut c_void)> = self.param_infos().iter().map(|info| (info.id, info.cookie)).collect();
+    /// Records every parameter's cookie (at instantiate: the ids are fixed from here on).
+    fn start_cookies(&mut self) {
+        let mut cookies: Vec<(u32, AtomicPtr<c_void>)> = self.param_infos().iter().map(|info| (info.id, AtomicPtr::new(info.cookie))).collect();
         cookies.sort_unstable_by_key(|c| c.0);
-        self.cookies = cookies;
+        let _ = self.state.cookies.set(cookies.into_boxed_slice());
     }
 
     /// The raw `clap_param_info` of every parameter the plugin describes (empty without `clap.params`).
     fn param_infos(&self) -> Vec<clap_param_info> {
-        // SAFETY: the extension pointer, when non-null, points to a static vtable in the plugin.
-        let Some(p) = (unsafe { self.params.as_ref() }) else { return Vec::new() };
-        let (Some(count), Some(get_info)) = (p.count, p.get_info) else { return Vec::new() };
-        // SAFETY: vtable call with the instance it belongs to.
-        let n = unsafe { count(self.plugin) }.min(MAX_PARAMS);
-        let mut out = Vec::new();
-        for i in 0..n {
-            // SAFETY: `clap_param_info` is plain data (integers, floats, char arrays, a nullable
-            // pointer); all-zero is a valid value.
-            let mut info: clap_param_info = unsafe { std::mem::zeroed() };
-            // SAFETY: index below the count; `info` is a valid, writable struct.
-            if !unsafe { get_info(self.plugin, i, &mut info) } {
-                continue;
-            }
-            out.push(info);
-        }
-        out
+        self.raw().param_infos()
+    }
+
+    /// The plugin's pointers, for the calls the main-thread service makes too.
+    fn raw(&self) -> Raw {
+        Raw { plugin: self.plugin, params: self.params, ports: self.ports, latency: self.latency }
     }
 
     pub fn params(&self) -> Vec<RawParam> {
@@ -1294,38 +1667,9 @@ impl Instance {
         ok.then(|| read_name(&buf)).filter(|s| !s.is_empty())
     }
 
-    /// The plugin's audio ports in one direction. A layout beyond `MAX_PORTS` ports or
-    /// `MAX_PORT_CHANNELS` channels per port is an error: we never hand a plugin fewer ports or
-    /// channels than it advertised.
+    /// The plugin's audio ports in one direction (see [`Raw::audio_ports`]).
     pub fn audio_ports(&self, is_input: bool) -> Result<Vec<PortInfo>, ClapError> {
-        // SAFETY: see `params`.
-        let Some(p) = (unsafe { self.ports.as_ref() }) else { return Ok(Vec::new()) };
-        let (Some(count), Some(get)) = (p.count, p.get) else { return Ok(Vec::new()) };
-        let dir = if is_input { "input" } else { "output" };
-        // SAFETY: vtable call with its instance.
-        let n = unsafe { count(self.plugin, is_input) };
-        if n > MAX_PORTS {
-            return Err(ClapError::Process(format!("{n} audio {dir} ports (at most {MAX_PORTS} supported)")));
-        }
-        let mut out = Vec::new();
-        for i in 0..n {
-            // SAFETY: plain data; all-zero (null port_type pointer) is valid.
-            let mut info: clap_audio_port_info = unsafe { std::mem::zeroed() };
-            // SAFETY: index below the count; `info` is writable.
-            if unsafe { get(self.plugin, i, is_input, &mut info) } {
-                if info.channel_count > MAX_PORT_CHANNELS {
-                    return Err(ClapError::Process(format!(
-                        "audio {dir} port {i} has {} channels (at most {MAX_PORT_CHANNELS} supported)",
-                        info.channel_count
-                    )));
-                }
-                out.push(PortInfo { channels: info.channel_count, main: info.flags & CLAP_AUDIO_PORT_IS_MAIN != 0 });
-            } else {
-                // Keep port indices aligned: an unreadable port still needs a (silent) buffer slot.
-                out.push(PortInfo { channels: 0, main: false });
-            }
-        }
-        Ok(out)
+        self.raw().audio_ports(is_input)
     }
 
     pub fn note_port(&self) -> Option<NotePort> {
@@ -1343,12 +1687,7 @@ impl Instance {
     }
 
     pub fn latency(&self) -> u32 {
-        // SAFETY: see `params`.
-        match unsafe { self.latency.as_ref() }.and_then(|l| l.get) {
-            // SAFETY: valid instance.
-            Some(f) => unsafe { f(self.plugin) },
-            None => 0,
-        }
+        self.raw().latency()
     }
 
     /// Input and output events dropped since the last call, as `(input, output)`; resets both counts.
@@ -1357,45 +1696,23 @@ impl Instance {
     }
 
     pub fn is_active(&self) -> bool {
-        self.active
+        self.state.active.load(Ordering::Acquire)
     }
 
+    /// Activates the plugin (deactivating it first), reads its cookies and remembers what it was
+    /// activated with, so the service can restart it. Main thread.
     pub fn activate(&mut self, sample_rate: f64, min_frames: u32, max_frames: u32) -> Result<(), ClapError> {
-        self.deactivate();
-        self.read_cookies();
-        let f = self.vt().activate.ok_or_else(|| ClapError::Process("plugin has no activate".into()))?;
-        // SAFETY: valid, inactive instance; arguments are sane (checked by the caller).
-        if !unsafe { f(self.plugin, sample_rate, min_frames, max_frames) } {
-            return Err(ClapError::Process("activate failed".into()));
-        }
-        self.active = true;
-        self.max_frames = max_frames as usize;
-        Ok(())
+        let raw = self.raw();
+        raw.deactivate(&self.state);
+        raw.activate(&self.state, sample_rate, min_frames, max_frames)
     }
 
     pub fn deactivate(&mut self) {
-        self.stop_processing();
-        if self.active {
-            if let Some(f) = self.vt().deactivate {
-                // SAFETY: valid, active instance.
-                unsafe { f(self.plugin) };
-            }
-            self.active = false;
-        }
-    }
-
-    fn stop_processing(&mut self) {
-        if self.processing {
-            if let Some(f) = self.vt().stop_processing {
-                // SAFETY: valid instance in the processing state.
-                unsafe { f(self.plugin) };
-            }
-            self.processing = false;
-        }
+        self.raw().deactivate(&self.state);
     }
 
     pub fn reset(&mut self) {
-        if self.active
+        if self.is_active()
             && let Some(f) = self.vt().reset
         {
             // SAFETY: valid, active instance.
@@ -1414,30 +1731,50 @@ impl Instance {
         events: &[Event],
         offset: u32,
         transport: Option<&Transport>,
-    ) -> Result<i32, ClapError> {
-        if !self.active {
-            return Err(ClapError::Process("not active".into()));
+    ) -> Result<i32, Fault> {
+        let r = self.process_block(frames, steady_time, inputs, outputs, events, offset, transport);
+        if let Err(f) = r {
+            // The reason for the service to log (the first one stands until it is reported), and
+            // the flag the mixer reads. No allocation, no lock.
+            let _ = self.state.fault.compare_exchange(0, f as u8, Ordering::AcqRel, Ordering::Relaxed);
+            self.state.failed.store(true, Ordering::Release);
         }
-        if frames == 0 || frames > self.max_frames || frames > inputs.frames || frames > outputs.frames {
-            return Err(ClapError::Process("block larger than the activated size".into()));
+        r
+    }
+
+    fn process_block(
+        &mut self,
+        frames: usize,
+        steady_time: i64,
+        inputs: &mut PortBuffers,
+        outputs: &mut PortBuffers,
+        events: &[Event],
+        offset: u32,
+        transport: Option<&Transport>,
+    ) -> Result<i32, Fault> {
+        if !self.is_active() {
+            return Err(Fault::NotActive);
         }
-        if !self.processing {
+        if frames == 0 || frames > self.state.max_frames.load(Ordering::Relaxed) as usize || frames > inputs.frames || frames > outputs.frames {
+            return Err(Fault::BlockTooLarge);
+        }
+        if !self.state.processing.load(Ordering::Relaxed) {
             let ok = match self.vt().start_processing {
                 // SAFETY: valid, active instance.
                 Some(f) => unsafe { f(self.plugin) },
                 None => true,
             };
             if !ok {
-                return Err(ClapError::Process("start_processing failed".into()));
+                return Err(Fault::StartProcessing);
             }
-            self.processing = true;
+            self.state.processing.store(true, Ordering::Relaxed);
         }
-        let process = self.vt().process.ok_or_else(|| ClapError::Process("plugin has no process".into()))?;
+        let process = self.vt().process.ok_or(Fault::NoProcess)?;
         self.raw.clear();
         let cap = self.raw.capacity();
         self.dropped_in = self.dropped_in.saturating_add(events.len().saturating_sub(cap));
         for e in events.iter().take(cap) {
-            self.raw.push(RawEvent::from_event(e, offset, &self.cookies));
+            self.raw.push(RawEvent::from_event(e, offset, self.state.cookies.get().map_or(&[], |c| &c[..])));
         }
         inputs.refresh();
         outputs.refresh();
@@ -1477,7 +1814,7 @@ impl Instance {
             }
         }
         self.out_params.clear();
-        if status == CLAP_PROCESS_ERROR { Err(ClapError::Process("plugin reported a processing error".into())) } else { Ok(status) }
+        if status == CLAP_PROCESS_ERROR { Err(Fault::PluginError) } else { Ok(status) }
     }
 }
 

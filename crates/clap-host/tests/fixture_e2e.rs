@@ -13,7 +13,7 @@ const SYNTH: &str = "clap:org.soundcraft.test.synth";
 fn scan_lists_both_fixture_plugins() {
     let dir = fixture_dir();
     let found = soundcraft_clap_host::scan_paths(&[dir.to_path_buf()]);
-    assert_eq!(found.len(), 6);
+    assert_eq!(found.len(), 7);
     let g = found.iter().find(|d| d.id == GAIN).unwrap();
     assert_eq!(g.name, "Fixture Gain");
     assert_eq!(g.vendor, "SoundCraft tests");

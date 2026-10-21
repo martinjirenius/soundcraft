@@ -19,6 +19,7 @@ pub mod offline;
 mod osc;
 pub mod pan;
 mod params;
+pub mod park;
 pub mod pitch_detect;
 pub mod plugins;
 pub mod spectrum;
@@ -26,6 +27,7 @@ mod util;
 
 pub use offline::FadeShape;
 pub use osc::Waveform;
+pub use park::{Busy, ParkGate, Parked};
 pub use plugins::eq::{eq1_response, eq7_response};
 
 use std::sync::Arc;
@@ -261,6 +263,39 @@ pub trait Plugin: Send {
     }
     /// Reads this instance's state from the UI thread (`None` when it has no state of its own).
     fn state_reader(&mut self) -> Option<Box<dyn PluginStateReader>> {
+        None
+    }
+    /// The main-thread service point of this instance (`None` for built-ins, which ask nothing of
+    /// their host). Like an editor handle it works while the instance processes on the audio
+    /// thread, and does nothing once the instance is gone.
+    fn service_handle(&mut self) -> Option<Box<dyn PluginService>> {
+        None
+    }
+}
+
+/// What a plugin asked of the host since the last [`PluginService::service`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServiceReport {
+    /// The plugin changed its own parameter values (a rescan, a program change): what a host
+    /// shows must be re-read with [`PluginService::live_param`]. Nothing was written to the session.
+    pub values_changed: bool,
+    /// The plugin's state changed (`mark_dirty`, `setDirty`): the session should capture it.
+    pub dirty: bool,
+}
+
+/// Answers what a hosted plugin asks of its host (callbacks, restarts, parameter rescans and
+/// flushes, state changes) on the main thread, for every hosted plugin whether or not its editor
+/// is open. Call [`PluginService::service`] from the main thread on a regular tick (the UI frame,
+/// or between blocks of an offline render). A restart deactivates and re-activates the plugin
+/// here, never on the audio thread: the audio thread passes the plugin by (see [`ParkGate`]) for
+/// the moment it takes.
+pub trait PluginService: Send {
+    /// Performs the plugin's pending requests and logs any failure with its reason.
+    fn service(&mut self) -> ServiceReport;
+    /// The plugin's own current value of a parameter (SoundCraft units), read from the live
+    /// plugin; `None` for an unknown id, a plugin that cannot say, or once the instance is gone.
+    /// Main thread only.
+    fn live_param(&mut self, _id: &str) -> Option<f32> {
         None
     }
 }

@@ -507,6 +507,7 @@ fn set_point(e: &mut Engine, p: &Value) -> Result<Value> {
 }
 
 fn write_range(e: &mut Engine, p: &Value) -> Result<Value> {
+    let live = e.live_params();
     let tracks = tracks_required(e, "automation.write_range", p)?;
     let param = lane_param(p, "automation.write_range")?;
     let r = range_param(e, "automation.write_range", p)?;
@@ -514,38 +515,44 @@ fn write_range(e: &mut Engine, p: &Value) -> Result<Value> {
     let s = e.session_mut();
     for t in &tracks {
         if let Some(tr) = s.track_mut(*t) {
-            let def = current_value(tr, &param);
+            // Outside the range the lane keeps the parameter's own value; when nobody can say
+            // what it is (an unset hosted parameter with no live plugin), the written value.
+            let def = current_value(live.as_deref(), tr, &param).unwrap_or(v);
             tr.lane_mut(&param).write_range(r.start, r.end, v, def);
         }
     }
     Ok(json!({}))
 }
 
-/// The advertised default of an insert's parameter: the best the engine knows when the plugin
-/// owns the value (nothing stored), and exact for a built-in.
+/// The advertised default of an insert's parameter: exact for a built-in, which always owns its
+/// value; for a hosted plugin it is not its value (Surge XT advertises 0 for ~800 parameters), so
+/// it is only used when no live plugin can say.
 fn plugin_default(tr: &soundcraft_model::Track, slot: u8, param: &str) -> Option<f32> {
     let ins = tr.mixer.inserts.get(usize::from(slot)).and_then(Option::as_ref)?;
     super::clap::plugin_info(&ins.plugin)?.params.iter().find(|x| x.id == param).map(|pi| pi.default)
 }
 
-/// The static (non-automated) value of a parameter on a track.
-pub(crate) fn current_value(tr: &soundcraft_model::Track, param: &AutoParam) -> f32 {
-    match param {
+/// The static (non-automated) value of a parameter on a track. A hosted plugin's parameter that
+/// nothing set belongs to the plugin: its value is the live plugin's (`live`), and `None` when
+/// there is no live plugin to ask (nothing is invented from the advertised default).
+pub(crate) fn current_value(live: Option<&dyn soundcraft_mix::LiveParams>, tr: &soundcraft_model::Track, param: &AutoParam) -> Option<f32> {
+    Some(match param {
         AutoParam::Volume => tr.mixer.volume_db,
         AutoParam::Pan(i) => tr.mixer.pan.get(usize::from(*i)).copied().unwrap_or(0.0),
         AutoParam::Mute => f32::from(u8::from(tr.mixer.mute)),
         AutoParam::SendLevel(i) => tr.mixer.sends.get(usize::from(*i)).and_then(Option::as_ref).map_or(-144.0, |s| s.level_db),
         AutoParam::SendPan(i) => tr.mixer.sends.get(usize::from(*i)).and_then(Option::as_ref).map_or(0.0, |s| s.pan),
         AutoParam::SendMute(i) => tr.mixer.sends.get(usize::from(*i)).and_then(Option::as_ref).map_or(0.0, |s| f32::from(u8::from(s.mute))),
-        AutoParam::Plugin { slot, param } => tr
-            .mixer
-            .inserts
-            .get(usize::from(*slot))
-            .and_then(Option::as_ref)
-            .and_then(|i| i.params.get(param).copied())
-            .or_else(|| plugin_default(tr, *slot, param))
-            .unwrap_or(0.0),
-    }
+        AutoParam::Plugin { slot, param } => {
+            let ins = tr.mixer.inserts.get(usize::from(*slot)).and_then(Option::as_ref)?;
+            match ins.params.get(param).copied() {
+                Some(v) => v,
+                // A built-in plugin has every value stored; its default is exact.
+                None if !soundcraft_mix::is_third_party(&ins.plugin) => plugin_default(tr, *slot, param)?,
+                None => live?.live_value(tr.id, usize::from(*slot), param)?,
+            }
+        }
+    })
 }
 
 fn clear_lane(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -583,6 +590,7 @@ fn thin(e: &mut Engine, p: &Value, all: bool) -> Result<Value> {
 }
 
 fn write_current(e: &mut Engine, p: &Value, all: bool) -> Result<Value> {
+    let live = e.live_params();
     let tracks = tracks_required(e, "automation.write_to_current", p)?;
     let r = range_param(e, "automation.write_to_current", p)?;
     let s = e.session_mut();
@@ -598,7 +606,8 @@ fn write_current(e: &mut Engine, p: &Value, all: bool) -> Result<Value> {
                 vec![AutoParam::parse(&tr.view).unwrap_or(AutoParam::Volume)]
             };
             for param in params {
-                let v = current_value(tr, &param);
+                // A parameter nobody set and no live plugin can read has no current value to write.
+                let Some(v) = current_value(live.as_deref(), tr, &param) else { continue };
                 tr.lane_mut(&param).write_range(r.start, r.end, v, v);
             }
         }

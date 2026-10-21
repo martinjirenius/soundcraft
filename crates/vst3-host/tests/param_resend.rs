@@ -2,7 +2,8 @@
 //! or saved session set": re-activating a plugin re-sends only the values the host set (a value
 //! only the plugin set is the plugin's own), and a loaded state gives every value back to the
 //! plugin. The count comes from the fixture's own counter, which only this file reads. It has its
-//! own test binary because the counter is process-wide.
+//! own test binary because the counter is process-wide. A restart the plugin asks for re-activates
+//! it as `prepare` does, and gives it back the same values.
 
 // The crate denies `unsafe` except in `ffi`. The only unsafe here loads the fixture library a
 // second time (dlopen of the same file returns the same image) to read its exported counter.
@@ -45,4 +46,24 @@ fn reactivation_resends_only_the_values_the_host_set() {
     p.prepare(48_000.0, 64, 2);
     p.process(&mut io, 64);
     assert_eq!(read() - before, 0, "a re-activation after a state load re-sent host values over the loaded state");
+
+    // A restart the plugin asks for (Mode "C" makes the fixture ask for a latency change) is a
+    // re-activation too: the two host-set values (Gain and Mode) go back in, and nothing else.
+    let mut svc = p.service_handle().expect("service handle");
+    assert!(p.set_param("7", 1.5));
+    assert!(p.set_param("3", 2.0));
+    let before = read();
+    p.process(&mut io, 64);
+    assert_eq!(read() - before, 2, "the first block sends the two edits");
+    for _ in 0..1000 {
+        svc.service();
+        if p.latency() == 7 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(p.latency(), 7, "the plugin was restarted");
+    let before = read();
+    p.process(&mut io, 64);
+    assert_eq!(read() - before, 2, "a restart re-sent exactly the host-set values");
 }

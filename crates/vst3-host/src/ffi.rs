@@ -15,7 +15,8 @@
 #![allow(clippy::unnecessary_cast)]
 
 use crate::{Vst3Error, scan};
-use soundcraft_dsp::Transport;
+use soundcraft_dsp::{ParkGate, Transport};
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
@@ -24,8 +25,8 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, TryLockError, mpsc};
 use std::time::Duration;
 use vst3::Steinberg::Vst::{self as sv};
 use vst3::Steinberg::Vst::{
-    IAudioProcessorTrait, IComponentHandlerTrait, IComponentTrait, IConnectionPointTrait, IEditControllerTrait, IEventListTrait,
-    IHostApplicationTrait, IMidiMappingTrait, IParamValueQueueTrait, IParameterChangesTrait,
+    IAttributeListTrait, IAudioProcessorTrait, IComponentHandler2Trait, IComponentHandlerTrait, IComponentTrait, IConnectionPointTrait,
+    IEditControllerTrait, IEventListTrait, IHostApplicationTrait, IMessageTrait, IMidiMappingTrait, IParamValueQueueTrait, IParameterChangesTrait,
 };
 use vst3::Steinberg::{self as sb};
 use vst3::Steinberg::{FUnknown, IBStreamTrait, IPlugFrameTrait, IPlugViewTrait, IPluginBaseTrait, IPluginFactory2Trait, IPluginFactoryTrait};
@@ -47,6 +48,14 @@ pub(crate) const PARAM_QUEUE_CAP: usize = 1024;
 const MAX_STATE_BYTES: usize = 64 << 20;
 /// Most editor parameter edits buffered between two UI frames.
 const EDIT_CAP: usize = 256;
+/// `restartComponent` flags the service acts on.
+const RESTART_RELOAD: u32 = sv::RestartFlags_::kReloadComponent as u32;
+const RESTART_IO: u32 = sv::RestartFlags_::kIoChanged as u32;
+const RESTART_LATENCY: u32 = sv::RestartFlags_::kLatencyChanged as u32;
+const RESTART_VALUES: u32 = sv::RestartFlags_::kParamValuesChanged as u32 | sv::RestartFlags_::kParamTitlesChanged as u32;
+/// Longest the main thread waits for the audio thread to leave the plugin before it tries again
+/// on its next service tick.
+const PARK_LIMIT: Duration = Duration::from_millis(50);
 /// Magic of SoundCraft's state container: `SCV3` + u32 LE component length + component state +
 /// u32 LE controller length + controller state.
 const STATE_MAGIC: &[u8; 4] = b"SCV3";
@@ -523,9 +532,7 @@ impl Bundle {
             connections: None,
             component_initialized: true,
             controller_initialized: false,
-            active: false,
-            processing: false,
-            max_frames: 0,
+            life: Lifecycle { component: component.clone(), processor: component.cast::<sv::IAudioProcessor>(), host: host.clone() },
             in_params: ComWrapper::new(ParamChanges::new(PARAM_QUEUE_CAP)),
             out_params: ComWrapper::new(ParamChanges::new(PARAM_QUEUE_CAP)),
             in_events: ComWrapper::new(EventList::new(EVENT_CAP)),
@@ -578,7 +585,12 @@ impl Bundle {
             }
         }
         inst.editor = Arc::new(EditorLink {
-            inner: Mutex::new(EditorInner { component: Some(inst.component.clone()), controller: inst.controller.clone(), ..EditorInner::default() }),
+            inner: Mutex::new(EditorInner {
+                component: Some(inst.component.clone()),
+                controller: inst.controller.clone(),
+                life: Some(inst.life.clone()),
+                ..EditorInner::default()
+            }),
         });
         Ok(inst)
     }
@@ -602,20 +614,54 @@ pub(crate) fn hex(cid: &[u8; 16]) -> String {
 
 /// The host context handed to `initialize` (`IHostApplication`) and to the controller
 /// (`IComponentHandler`: parameter edits made in the plugin's editor are queued for the UI, which
-/// writes them into the session, from where they reach the processor).
+/// writes them into the session, from where they reach the processor). It is also where the
+/// threads meet: the audio thread and the main-thread service share the plugin's lifecycle flags
+/// here (see [`ParkGate`]).
 pub(crate) struct HostContext {
-    pub latency_changed: AtomicBool,
-    pub restart_requested: AtomicBool,
+    /// `restartComponent` flags raised since the service last ran (OR-ed).
+    pub restart_flags: AtomicU32,
+    /// `IComponentHandler2::setDirty`: the plugin's state changed.
+    pub dirty: AtomicBool,
     /// `performEdit` values (normalized), bounded by `EDIT_CAP`.
     pub edits: Mutex<Vec<(u32, f64)>>,
+    /// How the audio thread and the main-thread service share the plugin.
+    pub gate: Arc<ParkGate>,
+    /// The component is active / in the processing state.
+    pub active: AtomicBool,
+    pub processing: AtomicBool,
+    /// What the plugin was last configured with, for a restart.
+    pub max_frames: AtomicU32,
+    pub sample_rate: AtomicU64,
+    pub mono: AtomicBool,
+    /// Latency read after the last `setActive(true)`.
+    pub latency: AtomicU32,
+    /// Activation or processing failed (set by the audio thread and the service, cleared by `prepare`).
+    pub failed: AtomicBool,
+    /// The first `process` failure since the service last reported it ([`Fault::encode`]; 0 = none).
+    pub fault: AtomicU64,
+    /// A signature of the bus layout the host's buffers were built for.
+    pub layout: AtomicU64,
+    /// Restarts the service completed: the audio thread re-sends the values the host set.
+    pub restarts: AtomicU64,
 }
 
 impl Default for HostContext {
     fn default() -> Self {
         HostContext {
-            latency_changed: AtomicBool::new(false),
-            restart_requested: AtomicBool::new(false),
+            restart_flags: AtomicU32::new(0),
+            dirty: AtomicBool::new(false),
             edits: Mutex::new(Vec::with_capacity(EDIT_CAP)),
+            gate: Arc::new(ParkGate::default()),
+            active: AtomicBool::new(false),
+            processing: AtomicBool::new(false),
+            max_frames: AtomicU32::new(0),
+            sample_rate: AtomicU64::new(0),
+            mono: AtomicBool::new(false),
+            latency: AtomicU32::new(0),
+            failed: AtomicBool::new(false),
+            fault: AtomicU64::new(0),
+            layout: AtomicU64::new(0),
+            restarts: AtomicU64::new(0),
         }
     }
 }
@@ -631,7 +677,168 @@ impl HostContext {
 }
 
 impl Class for HostContext {
-    type Interfaces = (sv::IHostApplication, sv::IComponentHandler);
+    type Interfaces = (sv::IHostApplication, sv::IComponentHandler, sv::IComponentHandler2);
+}
+
+/// Most attributes one host message holds, and the longest string or binary one attribute holds
+/// (plugin-supplied sizes are hostile input).
+const MAX_ATTRS: usize = 256;
+const MAX_ATTR_BYTES: usize = 16 << 20;
+
+enum Attr {
+    Int(i64),
+    Float(f64),
+    Str(Vec<u16>),
+    Bin(Vec<u8>),
+}
+
+/// The host's `IAttributeList` (what `IHostApplication::createInstance` hands out for messages).
+#[derive(Default)]
+pub(crate) struct HostAttributes {
+    map: Mutex<HashMap<String, Attr>>,
+}
+
+impl Class for HostAttributes {
+    type Interfaces = (sv::IAttributeList,);
+}
+
+impl HostAttributes {
+    /// The attribute key, `None` for a null id.
+    fn key(id: sv::IAttributeList_::AttrID) -> Option<String> {
+        // SAFETY: attribute ids are NUL-terminated strings (VST3 contract); null is handled.
+        (!id.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(id) }.to_string_lossy().into_owned())
+    }
+
+    fn set(&self, id: sv::IAttributeList_::AttrID, a: Attr) -> sb::tresult {
+        let Some(k) = HostAttributes::key(id) else { return sb::kInvalidArgument };
+        let mut m = self.map.lock().unwrap_or_else(PoisonError::into_inner);
+        if m.len() >= MAX_ATTRS && !m.contains_key(&k) {
+            return sb::kOutOfMemory;
+        }
+        m.insert(k, a);
+        sb::kResultOk
+    }
+}
+
+impl IAttributeListTrait for HostAttributes {
+    unsafe fn setInt(&self, id: sv::IAttributeList_::AttrID, value: i64) -> sb::tresult {
+        self.set(id, Attr::Int(value))
+    }
+    unsafe fn getInt(&self, id: sv::IAttributeList_::AttrID, value: *mut i64) -> sb::tresult {
+        let (Some(k), Some(out)) = (HostAttributes::key(id), (unsafe { value.as_mut() })) else { return sb::kInvalidArgument };
+        match self.map.lock().unwrap_or_else(PoisonError::into_inner).get(&k) {
+            Some(Attr::Int(v)) => {
+                *out = *v;
+                sb::kResultOk
+            }
+            _ => sb::kResultFalse,
+        }
+    }
+    unsafe fn setFloat(&self, id: sv::IAttributeList_::AttrID, value: f64) -> sb::tresult {
+        self.set(id, Attr::Float(value))
+    }
+    unsafe fn getFloat(&self, id: sv::IAttributeList_::AttrID, value: *mut f64) -> sb::tresult {
+        let (Some(k), Some(out)) = (HostAttributes::key(id), (unsafe { value.as_mut() })) else { return sb::kInvalidArgument };
+        match self.map.lock().unwrap_or_else(PoisonError::into_inner).get(&k) {
+            Some(Attr::Float(v)) => {
+                *out = *v;
+                sb::kResultOk
+            }
+            _ => sb::kResultFalse,
+        }
+    }
+    unsafe fn setString(&self, id: sv::IAttributeList_::AttrID, string: *const sv::TChar) -> sb::tresult {
+        if string.is_null() {
+            return sb::kInvalidArgument;
+        }
+        let mut s = Vec::new();
+        for i in 0..MAX_ATTR_BYTES / 2 {
+            // SAFETY: a NUL-terminated UTF-16 string (VST3 contract); we stop at the terminator.
+            let c = unsafe { *string.add(i) };
+            if c == 0 {
+                return self.set(id, Attr::Str(s));
+            }
+            s.push(c);
+        }
+        sb::kInvalidArgument
+    }
+    unsafe fn getString(&self, id: sv::IAttributeList_::AttrID, string: *mut sv::TChar, size_in_bytes: u32) -> sb::tresult {
+        let Some(k) = HostAttributes::key(id) else { return sb::kInvalidArgument };
+        let room = (size_in_bytes as usize / 2).saturating_sub(1);
+        if string.is_null() || size_in_bytes < 2 {
+            return sb::kInvalidArgument;
+        }
+        match self.map.lock().unwrap_or_else(PoisonError::into_inner).get(&k) {
+            Some(Attr::Str(s)) => {
+                let n = s.len().min(room);
+                for (i, c) in s.iter().take(n).enumerate() {
+                    // SAFETY: the caller's buffer holds `size_in_bytes` bytes; `i < n <= room`.
+                    unsafe { *string.add(i) = *c };
+                }
+                // SAFETY: `n <= room`, so index `n` is within the buffer.
+                unsafe { *string.add(n) = 0 };
+                sb::kResultOk
+            }
+            _ => sb::kResultFalse,
+        }
+    }
+    unsafe fn setBinary(&self, id: sv::IAttributeList_::AttrID, data: *const c_void, size_in_bytes: u32) -> sb::tresult {
+        let n = size_in_bytes as usize;
+        if n > MAX_ATTR_BYTES || (data.is_null() && n > 0) {
+            return sb::kInvalidArgument;
+        }
+        let bytes = if n == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: the plugin provides `n` readable bytes at `data`.
+            unsafe { std::slice::from_raw_parts(data.cast::<u8>(), n) }.to_vec()
+        };
+        self.set(id, Attr::Bin(bytes))
+    }
+    unsafe fn getBinary(&self, id: sv::IAttributeList_::AttrID, data: *mut *const c_void, size_in_bytes: *mut u32) -> sb::tresult {
+        let (Some(k), Some(d), Some(n)) = (HostAttributes::key(id), (unsafe { data.as_mut() }), (unsafe { size_in_bytes.as_mut() })) else {
+            return sb::kInvalidArgument;
+        };
+        match self.map.lock().unwrap_or_else(PoisonError::into_inner).get(&k) {
+            Some(Attr::Bin(b)) => {
+                // The pointer stays valid until the attribute is set again, as in the SDK's own list.
+                *d = b.as_ptr().cast::<c_void>();
+                *n = u32::try_from(b.len()).unwrap_or(0);
+                sb::kResultOk
+            }
+            _ => sb::kResultFalse,
+        }
+    }
+}
+
+/// The host's `IMessage` (what `IHostApplication::createInstance` hands out for a message a
+/// component and its controller exchange over their connection).
+pub(crate) struct HostMessage {
+    id: Mutex<std::ffi::CString>,
+    attrs: ComWrapper<HostAttributes>,
+}
+
+impl Class for HostMessage {
+    type Interfaces = (sv::IMessage,);
+}
+
+impl IMessageTrait for HostMessage {
+    unsafe fn getMessageID(&self) -> sb::FIDString {
+        // Valid until the id is set again, as in the SDK's own message.
+        self.id.lock().unwrap_or_else(PoisonError::into_inner).as_ptr()
+    }
+    unsafe fn setMessageID(&self, id: sb::FIDString) {
+        let s = if id.is_null() {
+            std::ffi::CString::default()
+        } else {
+            // SAFETY: a NUL-terminated message id (VST3 contract).
+            unsafe { std::ffi::CStr::from_ptr(id) }.to_owned()
+        };
+        *self.id.lock().unwrap_or_else(PoisonError::into_inner) = s;
+    }
+    unsafe fn getAttributes(&self) -> *mut sv::IAttributeList {
+        self.attrs.as_com_ref::<sv::IAttributeList>().map_or(std::ptr::null_mut(), |r| r.as_ptr())
+    }
 }
 
 impl IHostApplicationTrait for HostContext {
@@ -646,11 +853,28 @@ impl IHostApplicationTrait for HostContext {
         }
     }
 
-    unsafe fn createInstance(&self, _cid: *mut sb::TUID, _iid: *mut sb::TUID, obj: *mut *mut c_void) -> sb::tresult {
-        // IMessage / IAttributeList are not provided yet; plugins must cope with that.
+    /// Creates the host objects a plugin may ask for: an `IMessage` (with its attribute list) or
+    /// a bare `IAttributeList`. Anything else is refused.
+    unsafe fn createInstance(&self, cid: *mut sb::TUID, iid: *mut sb::TUID, obj: *mut *mut c_void) -> sb::tresult {
         // SAFETY: `obj` is the plugin's out-pointer (or null, handled).
-        if let Some(o) = unsafe { obj.as_mut() } {
-            *o = std::ptr::null_mut();
+        let Some(out) = (unsafe { obj.as_mut() }) else { return sb::kInvalidArgument };
+        *out = std::ptr::null_mut();
+        // SAFETY: the plugin passes pointers to TUIDs (or null, handled).
+        let (Some(cid), Some(iid)) = (unsafe { cid.as_ref() }, unsafe { iid.as_ref() }) else { return sb::kInvalidArgument };
+        let (cid, iid) = (tuid_bytes(cid), tuid_bytes(iid));
+        // As in the SDK's own host: the class and the interface asked for must be the same.
+        if cid == iid && iid == sv::IMessage::IID {
+            let m = ComWrapper::new(HostMessage { id: Mutex::new(std::ffi::CString::default()), attrs: ComWrapper::new(HostAttributes::default()) });
+            if let Some(p) = m.to_com_ptr::<sv::IMessage>() {
+                *out = p.into_raw().cast::<c_void>();
+                return sb::kResultOk;
+            }
+        } else if cid == iid && iid == sv::IAttributeList::IID {
+            let a = ComWrapper::new(HostAttributes::default());
+            if let Some(p) = a.to_com_ptr::<sv::IAttributeList>() {
+                *out = p.into_raw().cast::<c_void>();
+                return sb::kResultOk;
+            }
         }
         sb::kResultFalse
     }
@@ -675,11 +899,29 @@ impl IComponentHandlerTrait for HostContext {
     unsafe fn endEdit(&self, _id: sv::ParamID) -> sb::tresult {
         sb::kResultOk
     }
+    /// Noted for the main-thread service (any thread may call this): `kReloadComponent`,
+    /// `kIoChanged` and `kLatencyChanged` restart the plugin there, `kParamValuesChanged` and
+    /// `kParamTitlesChanged` make the host re-read what it shows.
     unsafe fn restartComponent(&self, flags: sb::int32) -> sb::tresult {
-        if flags as u32 & sv::RestartFlags_::kLatencyChanged as u32 != 0 {
-            self.latency_changed.store(true, Ordering::Relaxed);
+        self.restart_flags.fetch_or(flags as u32, Ordering::Relaxed);
+        sb::kResultOk
+    }
+}
+
+impl IComponentHandler2Trait for HostContext {
+    unsafe fn setDirty(&self, state: sb::TBool) -> sb::tresult {
+        if state != 0 {
+            self.dirty.store(true, Ordering::Relaxed);
         }
-        self.restart_requested.store(true, Ordering::Relaxed);
+        sb::kResultOk
+    }
+    unsafe fn requestOpenEditor(&self, _name: sb::FIDString) -> sb::tresult {
+        sb::kResultFalse
+    }
+    unsafe fn startGroupEdit(&self) -> sb::tresult {
+        sb::kResultOk
+    }
+    unsafe fn finishGroupEdit(&self) -> sb::tresult {
         sb::kResultOk
     }
 }
@@ -1107,6 +1349,30 @@ pub(crate) enum Fault {
     Plugin(&'static str, sb::tresult),
 }
 
+impl Fault {
+    const HOST: [&'static str; 3] = ["not active", "block larger than the configured size", "no audio processor"];
+    const CALLS: [&'static str; 2] = ["setProcessing", "process"];
+
+    /// The fault as a number a plain atomic can carry (never 0).
+    pub fn encode(self) -> u64 {
+        match self {
+            Fault::Host(what) => (1 << 40) | Fault::HOST.iter().position(|h| *h == what).unwrap_or(0) as u64,
+            Fault::Plugin(call, code) => {
+                (2 << 40) | ((Fault::CALLS.iter().position(|c| *c == call).unwrap_or(0) as u64) << 32) | u64::from(code as u32)
+            }
+        }
+    }
+
+    pub fn decode(v: u64) -> Option<Fault> {
+        let low = (v & 0xFFFF_FFFF) as u32;
+        match v >> 40 {
+            1 => Some(Fault::Host(Fault::HOST.get(low as usize).copied().unwrap_or("process failed"))),
+            2 => Some(Fault::Plugin(Fault::CALLS.get(((v >> 32) & 0xFF) as usize).copied().unwrap_or("process"), low as i32)),
+            _ => None,
+        }
+    }
+}
+
 impl std::fmt::Display for Fault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
@@ -1142,6 +1408,171 @@ fn apply_transport(c: &mut sv::ProcessContext, t: &Transport) {
     c.barPositionMusic = t.bar_start;
 }
 
+/// What bringing a plugin up and down needs: the component and processor, and the host context
+/// that holds the lifecycle flags. The instance owns one; the editor link keeps a clone, so the
+/// main-thread service can restart the plugin while the audio thread processes it (the thread
+/// that calls a method must have parked the audio thread: see `ParkGate`).
+#[derive(Clone)]
+pub(crate) struct Lifecycle {
+    component: ComPtr<sv::IComponent>,
+    processor: Option<ComPtr<sv::IAudioProcessor>>,
+    host: ComWrapper<HostContext>,
+}
+
+/// A signature of an audio bus layout, for telling whether the host's buffers still fit.
+pub(crate) fn layout_sig(l: &Layout) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for x in [1u64]
+        .into_iter()
+        .chain(l.inputs.iter().map(|&c| u64::from(c)))
+        .chain([2])
+        .chain(l.outputs.iter().map(|&c| u64::from(c)))
+        .chain([u64::from(l.event_input)])
+    {
+        h = (h ^ x).wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+impl Lifecycle {
+    fn processor(&self) -> Option<&ComPtr<sv::IAudioProcessor>> {
+        self.processor.as_ref()
+    }
+
+    fn bus_count(&self, media: sv::MediaTypes, dir: sv::BusDirections) -> i32 {
+        // SAFETY: valid component.
+        unsafe { self.component.getBusCount(media as sv::MediaType, dir as sv::BusDirection) }.clamp(0, MAX_BUSES)
+    }
+
+    fn arrangement(&self, dir: sv::BusDirections, index: i32) -> Option<sv::SpeakerArrangement> {
+        let p = self.processor()?;
+        let mut arr: sv::SpeakerArrangement = 0;
+        // SAFETY: valid processor; `arr` is writable.
+        ok(unsafe { p.getBusArrangement(dir as sv::BusDirection, index, &mut arr) }).then_some(arr)
+    }
+
+    fn bus_channels(&self, dir: sv::BusDirections, index: i32) -> u32 {
+        if let Some(arr) = self.arrangement(dir, index) {
+            return arr.count_ones().min(MAX_BUS_CHANNELS);
+        }
+        // SAFETY: plain data; all-zero is valid.
+        let mut info: sv::BusInfo = unsafe { std::mem::zeroed() };
+        // SAFETY: valid component; index below the bus count; `info` is writable.
+        if ok(unsafe { self.component.getBusInfo(sv::MediaTypes_::kAudio as sv::MediaType, dir as sv::BusDirection, index, &mut info) }) {
+            u32::try_from(info.channelCount).unwrap_or(0).min(MAX_BUS_CHANNELS)
+        } else {
+            0
+        }
+    }
+
+    /// Stops processing, deactivates, negotiates the bus layout (main buses mono or stereo as
+    /// asked, falling back to stereo and then to the plugin's own choice), activates the main
+    /// buses, sets up 32-bit processing and activates the component. Remembers the setup (a
+    /// restart repeats it). Main thread.
+    pub fn configure(&self, sample_rate: f64, max_frames: usize, mono: bool) -> Result<Layout, Vst3Error> {
+        self.shutdown();
+        let audio = sv::MediaTypes_::kAudio;
+        let event = sv::MediaTypes_::kEvent;
+        let (din, dout) = (sv::BusDirections_::kInput, sv::BusDirections_::kOutput);
+        let nin = self.bus_count(audio, din);
+        let nout = self.bus_count(audio, dout);
+        let current = |s: &Self, dir: sv::BusDirections, n: i32| -> Vec<sv::SpeakerArrangement> {
+            (0..n).map(|i| s.arrangement(dir, i).unwrap_or(sv::SpeakerArr::kStereo)).collect()
+        };
+        let want = if mono { sv::SpeakerArr::kMono } else { sv::SpeakerArr::kStereo };
+        let p = self.processor().ok_or_else(|| Vst3Error::Process("no audio processor".into()))?.clone();
+        // The layout is kept as negotiated here (`ok`: kResultOk only). kResultTrue is what
+        // many plugins answer to an accepted arrangement, so it is not reported as a refusal.
+        let mut arrangement_refused = false;
+        for main in [want, sv::SpeakerArr::kStereo] {
+            let mut ins = current(self, din, nin);
+            let mut outs = current(self, dout, nout);
+            if let Some(a) = ins.first_mut() {
+                *a = main;
+            }
+            if let Some(a) = outs.first_mut() {
+                *a = main;
+            }
+            // SAFETY: valid processor; the arrays hold exactly `nin`/`nout` arrangements and
+            // outlive the call.
+            let r = unsafe { p.setBusArrangements(ins.as_mut_ptr(), nin, outs.as_mut_ptr(), nout) };
+            if ok(r) {
+                break;
+            }
+            if main == want && r != sb::kResultTrue {
+                arrangement_refused = true;
+            }
+            if main == sv::SpeakerArr::kStereo {
+                break;
+            }
+        }
+        let layout = Layout {
+            inputs: (0..nin).map(|i| self.bus_channels(din, i)).collect(),
+            outputs: (0..nout).map(|i| self.bus_channels(dout, i)).collect(),
+            event_input: self.bus_count(event, din) > 0,
+            arrangement_refused,
+        };
+        // Main buses on, aux buses off (VST3 still gets buffers for every bus).
+        for (dir, n) in [(din, nin), (dout, nout)] {
+            for i in 0..n {
+                // SAFETY: valid component; index below the bus count.
+                unsafe { self.component.activateBus(audio as sv::MediaType, dir as sv::BusDirection, i, u8::from(i == 0)) };
+            }
+        }
+        if layout.event_input {
+            // SAFETY: valid component; event input bus 0 exists.
+            unsafe { self.component.activateBus(event as sv::MediaType, din as sv::BusDirection, 0, 1) };
+        }
+        let sample32 = sv::SymbolicSampleSizes_::kSample32 as i32;
+        // SAFETY: valid processor.
+        if !ok(unsafe { p.canProcessSampleSize(sample32) }) {
+            return Err(Vst3Error::Process("plugin cannot process 32-bit float".into()));
+        }
+        let max = i32::try_from(max_frames).unwrap_or(i32::MAX);
+        let mut setup = sv::ProcessSetup {
+            processMode: sv::ProcessModes_::kRealtime as i32,
+            symbolicSampleSize: sample32,
+            maxSamplesPerBlock: max,
+            sampleRate: sample_rate,
+        };
+        // SAFETY: valid processor, inactive; `setup` is a valid struct for the call.
+        if !ok(unsafe { p.setupProcessing(&mut setup) }) {
+            return Err(Vst3Error::Process("setupProcessing failed".into()));
+        }
+        // SAFETY: valid component, configured above.
+        if !ok(unsafe { self.component.setActive(1) }) {
+            return Err(Vst3Error::Process("setActive failed".into()));
+        }
+        let h = &*self.host;
+        h.max_frames.store(u32::try_from(max_frames).unwrap_or(u32::MAX), Ordering::Relaxed);
+        h.sample_rate.store(sample_rate.to_bits(), Ordering::Relaxed);
+        h.mono.store(mono, Ordering::Relaxed);
+        h.active.store(true, Ordering::Release);
+        Ok(layout)
+    }
+
+    /// `setProcessing(false)` + `setActive(false)` when needed.
+    pub fn shutdown(&self) {
+        if self.host.processing.swap(false, Ordering::AcqRel)
+            && let Some(p) = self.processor()
+        {
+            // SAFETY: valid processor in the processing state.
+            unsafe { p.setProcessing(0) };
+        }
+        if self.host.active.swap(false, Ordering::AcqRel) {
+            // SAFETY: valid, active component.
+            unsafe { self.component.setActive(0) };
+        }
+    }
+
+    /// The latency the plugin reports. Read it after `setActive(true)`: that is when a plugin
+    /// that announced `kLatencyChanged` reports the new value, and it is a main-thread call.
+    pub fn latency(&self) -> u32 {
+        // SAFETY: valid processor.
+        self.processor().map_or(0, |p| unsafe { p.getLatencySamples() })
+    }
+}
+
 /// A live plugin: component + audio processor (+ edit controller) and the host objects.
 pub(crate) struct Instance {
     processor: Option<ComPtr<sv::IAudioProcessor>>,
@@ -1151,9 +1582,7 @@ pub(crate) struct Instance {
     connections: Option<(ComPtr<sv::IConnectionPoint>, ComPtr<sv::IConnectionPoint>)>,
     component_initialized: bool,
     controller_initialized: bool,
-    active: bool,
-    processing: bool,
-    max_frames: usize,
+    life: Lifecycle,
     in_params: ComWrapper<ParamChanges>,
     out_params: ComWrapper<ParamChanges>,
     in_events: ComWrapper<EventList>,
@@ -1317,8 +1746,7 @@ impl Instance {
     }
 
     pub fn latency(&self) -> u32 {
-        // SAFETY: valid processor.
-        self.processor().map_or(0, |p| unsafe { p.getLatencySamples() })
+        self.life.latency()
     }
 
     pub fn tail(&self) -> u32 {
@@ -1327,115 +1755,14 @@ impl Instance {
     }
 
     pub fn is_active(&self) -> bool {
-        self.active
+        self.host.active.load(Ordering::Acquire)
     }
 
-    fn bus_count(&self, media: sv::MediaTypes, dir: sv::BusDirections) -> i32 {
-        // SAFETY: valid component.
-        unsafe { self.component.getBusCount(media as sv::MediaType, dir as sv::BusDirection) }.clamp(0, MAX_BUSES)
-    }
-
-    fn arrangement(&self, dir: sv::BusDirections, index: i32) -> Option<sv::SpeakerArrangement> {
-        let p = self.processor()?;
-        let mut arr: sv::SpeakerArrangement = 0;
-        // SAFETY: valid processor; `arr` is writable.
-        ok(unsafe { p.getBusArrangement(dir as sv::BusDirection, index, &mut arr) }).then_some(arr)
-    }
-
-    fn bus_channels(&self, dir: sv::BusDirections, index: i32) -> u32 {
-        if let Some(arr) = self.arrangement(dir, index) {
-            return arr.count_ones().min(MAX_BUS_CHANNELS);
-        }
-        // SAFETY: plain data; all-zero is valid.
-        let mut info: sv::BusInfo = unsafe { std::mem::zeroed() };
-        // SAFETY: valid component; index below the bus count; `info` is writable.
-        if ok(unsafe { self.component.getBusInfo(sv::MediaTypes_::kAudio as sv::MediaType, dir as sv::BusDirection, index, &mut info) }) {
-            u32::try_from(info.channelCount).unwrap_or(0).min(MAX_BUS_CHANNELS)
-        } else {
-            0
-        }
-    }
-
-    /// Stops processing, deactivates, negotiates the bus layout (main buses mono or stereo as
-    /// asked, falling back to stereo and then to the plugin's own choice), activates the main
-    /// buses, sets up 32-bit processing and activates the component.
+    /// Stops processing, deactivates, negotiates the bus layout and activates the component
+    /// (see [`Lifecycle::configure`]), then sets up what only the audio side needs.
     pub fn configure(&mut self, sample_rate: f64, max_frames: usize, mono: bool) -> Result<Layout, Vst3Error> {
-        self.shutdown();
-        let audio = sv::MediaTypes_::kAudio;
-        let event = sv::MediaTypes_::kEvent;
-        let (din, dout) = (sv::BusDirections_::kInput, sv::BusDirections_::kOutput);
-        let nin = self.bus_count(audio, din);
-        let nout = self.bus_count(audio, dout);
-        let current = |s: &Self, dir: sv::BusDirections, n: i32| -> Vec<sv::SpeakerArrangement> {
-            (0..n).map(|i| s.arrangement(dir, i).unwrap_or(sv::SpeakerArr::kStereo)).collect()
-        };
-        let want = if mono { sv::SpeakerArr::kMono } else { sv::SpeakerArr::kStereo };
-        let p = self.processor().ok_or_else(|| Vst3Error::Process("no audio processor".into()))?.clone();
-        // The layout is kept as negotiated here (`ok`: kResultOk only). kResultTrue is what
-        // many plugins answer to an accepted arrangement, so it is not reported as a refusal.
-        let mut arrangement_refused = false;
-        for main in [want, sv::SpeakerArr::kStereo] {
-            let mut ins = current(self, din, nin);
-            let mut outs = current(self, dout, nout);
-            if let Some(a) = ins.first_mut() {
-                *a = main;
-            }
-            if let Some(a) = outs.first_mut() {
-                *a = main;
-            }
-            // SAFETY: valid processor; the arrays hold exactly `nin`/`nout` arrangements and
-            // outlive the call.
-            let r = unsafe { p.setBusArrangements(ins.as_mut_ptr(), nin, outs.as_mut_ptr(), nout) };
-            if ok(r) {
-                break;
-            }
-            if main == want && r != sb::kResultTrue {
-                arrangement_refused = true;
-            }
-            if main == sv::SpeakerArr::kStereo {
-                break;
-            }
-        }
-        let layout = Layout {
-            inputs: (0..nin).map(|i| self.bus_channels(din, i)).collect(),
-            outputs: (0..nout).map(|i| self.bus_channels(dout, i)).collect(),
-            event_input: self.bus_count(event, din) > 0,
-            arrangement_refused,
-        };
-        // Main buses on, aux buses off (VST3 still gets buffers for every bus).
-        for (dir, n) in [(din, nin), (dout, nout)] {
-            for i in 0..n {
-                // SAFETY: valid component; index below the bus count.
-                unsafe { self.component.activateBus(audio as sv::MediaType, dir as sv::BusDirection, i, u8::from(i == 0)) };
-            }
-        }
-        if layout.event_input {
-            // SAFETY: valid component; event input bus 0 exists.
-            unsafe { self.component.activateBus(event as sv::MediaType, din as sv::BusDirection, 0, 1) };
-        }
+        let layout = self.life.configure(sample_rate, max_frames, mono)?;
         self.event_in = layout.event_input;
-        let sample32 = sv::SymbolicSampleSizes_::kSample32 as i32;
-        // SAFETY: valid processor.
-        if !ok(unsafe { p.canProcessSampleSize(sample32) }) {
-            return Err(Vst3Error::Process("plugin cannot process 32-bit float".into()));
-        }
-        let max = i32::try_from(max_frames).unwrap_or(i32::MAX);
-        let mut setup = sv::ProcessSetup {
-            processMode: sv::ProcessModes_::kRealtime as i32,
-            symbolicSampleSize: sample32,
-            maxSamplesPerBlock: max,
-            sampleRate: sample_rate,
-        };
-        // SAFETY: valid processor, inactive; `setup` is a valid struct for the call.
-        if !ok(unsafe { p.setupProcessing(&mut setup) }) {
-            return Err(Vst3Error::Process("setupProcessing failed".into()));
-        }
-        // SAFETY: valid component, configured above.
-        if !ok(unsafe { self.component.setActive(1) }) {
-            return Err(Vst3Error::Process("setActive failed".into()));
-        }
-        self.active = true;
-        self.max_frames = max_frames;
         self.context.sampleRate = sample_rate;
         self.context.tempo = 120.0;
         self.context.timeSigNumerator = 4;
@@ -1444,24 +1771,15 @@ impl Instance {
         #[allow(clippy::unnecessary_cast)]
         let flags = (sv::ProcessContext_::StatesAndFlags_::kTempoValid | sv::ProcessContext_::StatesAndFlags_::kTimeSigValid) as u32;
         self.context.state = flags;
-        self.host.latency_changed.store(false, Ordering::Relaxed);
+        self.host.layout.store(layout_sig(&layout), Ordering::Release);
+        // This configure answers any restart the plugin asked for before it.
+        self.host.restart_flags.fetch_and(!(RESTART_RELOAD | RESTART_IO | RESTART_LATENCY), Ordering::AcqRel);
         Ok(layout)
     }
 
     /// `setProcessing(false)` + `setActive(false)` when needed.
     pub fn shutdown(&mut self) {
-        if self.processing {
-            if let Some(p) = self.processor() {
-                // SAFETY: valid processor in the processing state.
-                unsafe { p.setProcessing(0) };
-            }
-            self.processing = false;
-        }
-        if self.active {
-            // SAFETY: valid, active component.
-            unsafe { self.component.setActive(0) };
-            self.active = false;
-        }
+        self.life.shutdown();
     }
 
     /// Runs one `process` call over `frames` frames: `params` become one point each at offset 0,
@@ -1480,21 +1798,43 @@ impl Instance {
         project_time: i64,
         transport: Option<&Transport>,
     ) -> Result<(), Fault> {
-        if !self.active {
+        let r = self.process_block(frames, inputs, outputs, params, controls, notes, offset, project_time, transport);
+        if let Err(f) = r {
+            // The reason for the service to log (the first one stands until it is reported), and
+            // the flag the mixer reads. No allocation, no lock.
+            let _ = self.host.fault.compare_exchange(0, f.encode(), Ordering::AcqRel, Ordering::Relaxed);
+            self.host.failed.store(true, Ordering::Release);
+        }
+        r
+    }
+
+    fn process_block(
+        &mut self,
+        frames: usize,
+        inputs: &mut BusBuffers,
+        outputs: &mut BusBuffers,
+        params: &[(u32, f64)],
+        controls: &[(u32, u32, f64)],
+        notes: &[NoteEvent],
+        offset: u32,
+        project_time: i64,
+        transport: Option<&Transport>,
+    ) -> Result<(), Fault> {
+        if !self.is_active() {
             return Err(Fault::Host("not active"));
         }
-        if frames == 0 || frames > self.max_frames || frames > inputs.frames || frames > outputs.frames {
+        if frames == 0 || frames > self.host.max_frames.load(Ordering::Relaxed) as usize || frames > inputs.frames || frames > outputs.frames {
             return Err(Fault::Host("block larger than the configured size"));
         }
         let p = self.processor.clone().ok_or(Fault::Host("no audio processor"))?;
-        if !self.processing {
+        if !self.host.processing.load(Ordering::Relaxed) {
             // SAFETY: valid, active processor.
             let r = unsafe { p.setProcessing(1) };
             // Many plugins return kNotImplemented here because they need no processing call.
             if r != sb::kNotImplemented && !accepted(r) {
                 return Err(Fault::Plugin("setProcessing", r));
             }
-            self.processing = true;
+            self.host.processing.store(true, Ordering::Relaxed);
         }
         self.in_params.clear();
         for &(id, v) in params.iter().take(PARAM_QUEUE_CAP) {
@@ -1636,9 +1976,18 @@ struct EditorInner {
     component: Option<ComPtr<sv::IComponent>>,
     /// `None` once the instance is gone, or without an edit controller.
     controller: Option<ComPtr<sv::IEditController>>,
+    /// What a restart needs; `None` once the instance is gone.
+    life: Option<Lifecycle>,
     view: Option<ComPtr<sb::IPlugView>>,
     frame: Option<ComWrapper<PlugFrame>>,
     window: Option<window::HostWindow>,
+}
+
+/// What [`EditorLink::service`] found that the caller reports on.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Serviced {
+    pub values_changed: bool,
+    pub dirty: bool,
 }
 
 /// The link between an instance and its editor and state handles. The instance may process on
@@ -1857,6 +2206,77 @@ impl EditorLink {
         }
     }
 
+    /// The plugin's own current normalized value of a parameter (`getParamNormalized`, main
+    /// thread: the UI thread, or the render thread of an engine that owns its plugins; `None`
+    /// without a controller or once the instance is gone).
+    pub fn live_normalized(&self, id: u32) -> Option<f64> {
+        let g = self.lock();
+        let c = g.controller.as_ref()?;
+        // SAFETY: valid controller (the instance clears it under this lock before it terminates),
+        // main thread.
+        let v = unsafe { c.getParamNormalized(id) };
+        v.is_finite().then(|| v.clamp(0.0, 1.0))
+    }
+
+    /// Answers what the plugin asked of the host since the last call, on the main thread, whether
+    /// or not its editor is open: `restartComponent` (`kReloadComponent`, `kIoChanged` and
+    /// `kLatencyChanged` re-configure and re-activate it with the audio thread parked meanwhile;
+    /// `kParamValuesChanged` and `kParamTitlesChanged` ask the host to re-read what it shows),
+    /// `setDirty`, and a process failure the audio thread recorded, which is logged here with its
+    /// reason. `id` names the plugin in the log.
+    pub fn service(&self, host: &HostContext, id: &str) -> Serviced {
+        let mut out = Serviced::default();
+        let g = self.lock();
+        let Some(life) = g.life.clone() else { return out };
+        let flags = host.restart_flags.swap(0, Ordering::AcqRel);
+        if flags & (RESTART_VALUES | RESTART_RELOAD | RESTART_IO | RESTART_LATENCY) != 0 {
+            out.values_changed = true;
+        }
+        if flags & (RESTART_RELOAD | RESTART_IO | RESTART_LATENCY) != 0 {
+            EditorLink::restart(&life, host, id, flags);
+        }
+        out.dirty = host.dirty.swap(false, Ordering::Relaxed);
+        if let Some(f) = Fault::decode(host.fault.swap(0, Ordering::AcqRel)) {
+            log::warn!("{id}: VST3 processing failed: {f}");
+        }
+        out
+    }
+
+    /// Deactivates, re-configures and re-activates the plugin as it asked, here on the main
+    /// thread with the audio thread parked: for the blocks that takes, the plugin counts as
+    /// inactive and its buffers are left untouched. The latency is read after `setActive(true)`
+    /// (where a plugin that announced `kLatencyChanged` reports the new one). A bus layout the
+    /// host's buffers do not fit leaves the plugin deactivated and failed: it takes a `prepare`
+    /// to size new buffers.
+    fn restart(life: &Lifecycle, host: &HostContext, id: &str, flags: u32) {
+        let rate = f64::from_bits(host.sample_rate.load(Ordering::Relaxed));
+        let max = host.max_frames.load(Ordering::Relaxed);
+        if rate.is_nan() || rate <= 0.0 || max == 0 {
+            // Never configured (`prepare` has not run): nothing to restart.
+            return;
+        }
+        let Some(_parked) = host.gate.park(PARK_LIMIT) else {
+            // The audio thread is inside the plugin longer than we wait: try again next tick.
+            host.restart_flags.fetch_or(flags, Ordering::Relaxed);
+            return;
+        };
+        match life.configure(rate, max as usize, host.mono.load(Ordering::Relaxed)) {
+            Ok(layout) if layout_sig(&layout) == host.layout.load(Ordering::Acquire) => {
+                host.latency.store(life.latency(), Ordering::Release);
+                host.failed.store(false, Ordering::Release);
+                host.restarts.fetch_add(1, Ordering::AcqRel);
+            }
+            result => {
+                life.shutdown();
+                host.failed.store(true, Ordering::Release);
+                match result {
+                    Ok(_) => log::warn!("{id}: restart failed: the audio bus layout changed; it applies at the next prepare"),
+                    Err(e) => log::warn!("{id}: restart failed: {e}"),
+                }
+            }
+        }
+    }
+
     /// Called by the instance before it terminates: closes the editor and cuts the handles off.
     /// Returns whether plugin objects had to be leaked.
     fn kill(&self) -> bool {
@@ -1881,6 +2301,7 @@ impl EditorLink {
         }
         g.component = None;
         g.controller = None;
+        g.life = None;
         leaked
     }
 }
@@ -2308,7 +2729,7 @@ mod tests {
             assert_eq!(h.restartComponent(sv::RestartFlags_::kLatencyChanged as i32), sb::kResultOk);
         }
         assert_eq!(read_c16(&name), "SoundCraft");
-        assert!(h.latency_changed.load(Ordering::Relaxed));
+        assert_eq!(h.restart_flags.load(Ordering::Relaxed), sv::RestartFlags_::kLatencyChanged as u32);
         assert_eq!(hex(&[0xAB; 16]), "AB".repeat(16));
     }
 }

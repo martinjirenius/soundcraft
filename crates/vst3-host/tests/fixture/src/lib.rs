@@ -15,6 +15,20 @@
 //!   sample is the velocity of the held note (sample-accurate), 0 when none. Poly pressure, and
 //!   MIDI CC 7 through `IMidiMapping` (hidden parameter 1), set it to their value too.
 //!
+//! The gain plugin asks things of the host, so tests can check the host answers them. The triggers
+//! are the ones a test controls: `Plugin::load_state` with a bare component state `MSG` (the
+//! component allocates a message through the host's `IHostApplication::createInstance`, fills it
+//! with an int, a float, a string and a binary, and sends it to its controller, which checks it
+//! and moves "Freq" to 0.25), or `REQ` + one byte `2` (the controller does a program change: gain
+//! becomes 0.9 and it calls `restartComponent(kParamValuesChanged)`); and a Mode value of 1.0
+//! (plain 2) reaching `process`, after which the plugin's latency becomes 7 (it reports 7 only
+//! after the next `setActive(true)`, as the SDK says) and the controller calls
+//! `restartComponent(kLatencyChanged)`. `setDirty` is called with the program change too.
+//!
+//! The gain plugin is strict about threads: `setActive`, `getLatencySamples` and `setupProcessing`
+//! must run on the thread that created it (the main thread), and `setActive` never while
+//! `process` runs on another thread. A wrong answer aborts the process.
+//!
 //! The module checks the host's module lifecycle the way real plugins depend on it (see "module
 //! lifecycle" below) and aborts the process when it is broken.
 //!
@@ -23,10 +37,12 @@
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
 use std::ffi::{c_char, c_int, c_void};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::thread::ThreadId;
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
-use vst3::{Class, ComRef, ComWrapper, uid};
+use vst3::{Class, ComPtr, ComRef, ComWrapper, Interface, uid};
 
 const GAIN_CID: TUID = uid(0x5C0A1D00, 0x11112222, 0x33334444, 0x55556666);
 const GAIN_CTRL_CID: TUID = uid(0x5C0A1D01, 0x11112222, 0x33334444, 0x55556666);
@@ -76,11 +92,61 @@ pub extern "C" fn fixture_param_points() -> u64 {
     PARAM_POINTS.load(Ordering::SeqCst)
 }
 
+/// A COM pointer the fixture keeps across threads (the host calls from several).
+struct Held<T>(T);
+// SAFETY: the fixture's COM objects are used from one thread at a time in the tests.
+unsafe impl<T> Send for Held<T> {}
+
+/// Allocates a message through the host's `IHostApplication::createInstance`, as plugins do.
+fn new_message(host: &ComPtr<IHostApplication>) -> Option<ComPtr<IMessage>> {
+    let mut tuid: TUID = IMessage::IID.map(|b| b as c_char);
+    let mut obj: *mut c_void = std::ptr::null_mut();
+    let iid: *mut TUID = &mut tuid;
+    if unsafe { host.createInstance(iid, iid, &mut obj) } != kResultOk {
+        return None;
+    }
+    unsafe { ComPtr::from_raw(obj as *mut IMessage) }
+}
+
+fn wide(s: &str) -> Vec<TChar> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// A message `id` with one int attribute `kind`/`samples`, sent to the peer.
+fn send_request(host: &Mutex<Option<Held<ComPtr<IHostApplication>>>>, peer: &Mutex<Option<Held<ComPtr<IConnectionPoint>>>>, id: &std::ffi::CStr, key: &std::ffi::CStr, value: i64) -> bool {
+    let (Some(host), Some(peer)) = (host.lock().unwrap().as_ref().map(|h| h.0.clone()), peer.lock().unwrap().as_ref().map(|p| p.0.clone())) else {
+        return false;
+    };
+    let Some(msg) = new_message(&host) else { return false };
+    unsafe {
+        msg.setMessageID(id.as_ptr());
+        let Some(attrs) = ComRef::from_raw(msg.getAttributes()) else { return false };
+        attrs.setInt(key.as_ptr(), value);
+        peer.notify(msg.as_ptr()) == kResultOk
+    }
+}
+
 struct GainProcessor {
     /// Normalized gain (plain = 2 × normalized).
     gain: AtomicU64,
     arrangement: AtomicU64,
+    /// The thread that created the plugin: the main thread.
+    main: ThreadId,
+    in_process: AtomicBool,
+    /// The latency reported now, and the one it becomes at the next `setActive(true)`.
+    latency: AtomicU32,
+    latency_next: AtomicU32,
+    /// The plugin asked for its latency change already (it asks once).
+    asked: AtomicBool,
+    host: Mutex<Option<Held<ComPtr<IHostApplication>>>>,
+    peer: Mutex<Option<Held<ComPtr<IConnectionPoint>>>>,
     _live: Live,
+}
+
+impl GainProcessor {
+    fn on_main(&self, what: &str) {
+        assert_eq!(std::thread::current().id(), self.main, "{what} must run on the main thread");
+    }
 }
 
 impl Class for GainProcessor {
@@ -90,6 +156,9 @@ impl Class for GainProcessor {
 impl IPluginBaseTrait for GainProcessor {
     unsafe fn initialize(&self, context: *mut FUnknown) -> tresult {
         assert!(!context.is_null(), "host context");
+        if let Some(c) = unsafe { ComRef::from_raw(context) } {
+            *self.host.lock().unwrap() = c.cast::<IHostApplication>().map(Held);
+        }
         kResultOk
     }
     unsafe fn terminate(&self) -> tresult {
@@ -99,13 +168,42 @@ impl IPluginBaseTrait for GainProcessor {
 
 impl IConnectionPointTrait for GainProcessor {
     unsafe fn connect(&self, other: *mut IConnectionPoint) -> tresult {
-        if other.is_null() { kInvalidArgument } else { kResultOk }
+        let Some(o) = (unsafe { ComRef::from_raw(other) }) else { return kInvalidArgument };
+        *self.peer.lock().unwrap() = Some(Held(o.to_com_ptr()));
+        kResultOk
     }
     unsafe fn disconnect(&self, _other: *mut IConnectionPoint) -> tresult {
+        *self.peer.lock().unwrap() = None;
         kResultOk
     }
-    unsafe fn notify(&self, _message: *mut IMessage) -> tresult {
+    unsafe fn notify(&self, message: *mut IMessage) -> tresult {
+        let Some(m) = (unsafe { ComRef::from_raw(message) }) else { return kInvalidArgument };
+        if unsafe { std::ffi::CStr::from_ptr(m.getMessageID()) }.to_bytes() == b"latency" {
+            let attrs = unsafe { ComRef::from_raw(m.getAttributes()) }.expect("message attributes");
+            let mut v = 0i64;
+            assert_eq!(unsafe { attrs.getInt(c"samples".as_ptr(), &mut v) }, kResultOk);
+            self.latency_next.store(v as u32, Ordering::SeqCst);
+        }
         kResultOk
+    }
+}
+
+impl GainProcessor {
+    /// A message with one attribute of each kind, to the controller (which checks it).
+    fn send_ping(&self) -> bool {
+        let (Some(host), Some(peer)) = (self.host.lock().unwrap().as_ref().map(|h| h.0.clone()), self.peer.lock().unwrap().as_ref().map(|p| p.0.clone())) else {
+            return false;
+        };
+        let Some(msg) = new_message(&host) else { return false };
+        unsafe {
+            msg.setMessageID(c"ping".as_ptr());
+            let Some(attrs) = ComRef::from_raw(msg.getAttributes()) else { return false };
+            let ok = attrs.setInt(c"n".as_ptr(), 42) == kResultOk
+                && attrs.setFloat(c"f".as_ptr(), 1.5) == kResultOk
+                && attrs.setString(c"s".as_ptr(), wide("h\u{e9}llo").as_ptr()) == kResultOk
+                && attrs.setBinary(c"b".as_ptr(), [1u8, 2, 3].as_ptr().cast(), 3) == kResultOk;
+            ok && peer.notify(msg.as_ptr()) == kResultOk
+        }
     }
 }
 
@@ -133,14 +231,30 @@ impl IComponentTrait for GainProcessor {
     unsafe fn activateBus(&self, _m: MediaType, _d: BusDirection, _i: i32, _s: TBool) -> tresult {
         kResultOk
     }
-    unsafe fn setActive(&self, _state: TBool) -> tresult {
+    unsafe fn setActive(&self, state: TBool) -> tresult {
+        self.on_main("setActive");
+        assert!(!self.in_process.load(Ordering::SeqCst), "setActive while process runs on another thread");
+        if state != 0 {
+            // A latency change takes effect when the plugin is activated (see kLatencyChanged).
+            self.latency.store(self.latency_next.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
         kResultOk
     }
     unsafe fn setState(&self, state: *mut IBStream) -> tresult {
         let Some(s) = (unsafe { ComRef::from_raw(state) }) else { return kInvalidArgument };
         let mut bytes = [0u8; 8];
         let mut n = 0;
-        if unsafe { s.read(bytes.as_mut_ptr().cast(), 8, &mut n) } != kResultOk || n != 8 {
+        if unsafe { s.read(bytes.as_mut_ptr().cast(), 8, &mut n) } != kResultOk {
+            return kResultFalse;
+        }
+        // The tests' triggers (see the module docs).
+        if n == 3 && &bytes[..3] == b"MSG" {
+            return if self.send_ping() { kResultOk } else { kResultFalse };
+        }
+        if n == 4 && &bytes[..3] == b"REQ" {
+            return if send_request(&self.host, &self.peer, c"request", c"kind", i64::from(bytes[3])) { kResultOk } else { kResultFalse };
+        }
+        if n != 8 {
             return kResultFalse;
         }
         let g = f64::from_le_bytes(bytes);
@@ -181,9 +295,11 @@ impl IAudioProcessorTrait for GainProcessor {
         if size == SymbolicSampleSizes_::kSample32 as i32 { kResultOk } else { kNotImplemented }
     }
     unsafe fn getLatencySamples(&self) -> u32 {
-        3
+        self.on_main("getLatencySamples");
+        self.latency.load(Ordering::SeqCst)
     }
     unsafe fn setupProcessing(&self, setup: *mut ProcessSetup) -> tresult {
+        self.on_main("setupProcessing");
         let s = unsafe { &*setup };
         assert_eq!(s.symbolicSampleSize, SymbolicSampleSizes_::kSample32 as i32);
         assert!(s.maxSamplesPerBlock > 0 && s.sampleRate > 0.0);
@@ -193,6 +309,18 @@ impl IAudioProcessorTrait for GainProcessor {
         kNotImplemented
     }
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
+        self.in_process.store(true, Ordering::SeqCst);
+        let r = unsafe { self.process_block(data) };
+        self.in_process.store(false, Ordering::SeqCst);
+        r
+    }
+    unsafe fn getTailSamples(&self) -> u32 {
+        0
+    }
+}
+
+impl GainProcessor {
+    unsafe fn process_block(&self, data: *mut ProcessData) -> tresult {
         let d = unsafe { &*data };
         assert!(!d.processContext.is_null());
         if let Some(changes) = unsafe { ComRef::from_raw(d.inputParameterChanges) } {
@@ -203,6 +331,10 @@ impl IAudioProcessorTrait for GainProcessor {
                 PARAM_POINTS.fetch_add(n.max(0) as u64, Ordering::SeqCst);
                 if unsafe { q.getParameterId() } == 7 && n > 0 && unsafe { q.getPoint(n - 1, &mut off, &mut v) } == kResultOk {
                     self.gain.store(v.to_bits(), Ordering::Relaxed);
+                }
+                // Mode "C": the plugin asks for a latency change, through its controller.
+                if unsafe { q.getParameterId() } == 3 && n > 0 && unsafe { q.getPoint(n - 1, &mut off, &mut v) } == kResultOk && v >= 0.99 && !self.asked.swap(true, Ordering::SeqCst) {
+                    send_request(&self.host, &self.peer, c"request", c"kind", 1);
                 }
             }
         }
@@ -227,15 +359,23 @@ impl IAudioProcessorTrait for GainProcessor {
         }
         kResultOk
     }
-    unsafe fn getTailSamples(&self) -> u32 {
-        0
-    }
 }
 
 struct GainController {
     gain: AtomicU64,
     freq: AtomicU64,
+    host: Mutex<Option<Held<ComPtr<IHostApplication>>>>,
+    peer: Mutex<Option<Held<ComPtr<IConnectionPoint>>>>,
+    handler: Mutex<Option<Held<ComPtr<IComponentHandler>>>>,
     _live: Live,
+}
+
+impl GainController {
+    /// What the plugin asks of the host: `restartComponent` with these flags.
+    fn restart(&self, flags: i32) {
+        let h = self.handler.lock().unwrap().as_ref().map(|h| h.0.clone()).expect("component handler");
+        assert_eq!(unsafe { h.restartComponent(flags) }, kResultOk);
+    }
 }
 
 struct View {
@@ -299,7 +439,10 @@ impl Class for GainController {
 }
 
 impl IPluginBaseTrait for GainController {
-    unsafe fn initialize(&self, _context: *mut FUnknown) -> tresult {
+    unsafe fn initialize(&self, context: *mut FUnknown) -> tresult {
+        if let Some(c) = unsafe { ComRef::from_raw(context) } {
+            *self.host.lock().unwrap() = c.cast::<IHostApplication>().map(Held);
+        }
         kResultOk
     }
     unsafe fn terminate(&self) -> tresult {
@@ -309,12 +452,56 @@ impl IPluginBaseTrait for GainController {
 
 impl IConnectionPointTrait for GainController {
     unsafe fn connect(&self, other: *mut IConnectionPoint) -> tresult {
-        if other.is_null() { kInvalidArgument } else { kResultOk }
-    }
-    unsafe fn disconnect(&self, _other: *mut IConnectionPoint) -> tresult {
+        let Some(o) = (unsafe { ComRef::from_raw(other) }) else { return kInvalidArgument };
+        *self.peer.lock().unwrap() = Some(Held(o.to_com_ptr()));
         kResultOk
     }
-    unsafe fn notify(&self, _message: *mut IMessage) -> tresult {
+    unsafe fn disconnect(&self, _other: *mut IConnectionPoint) -> tresult {
+        *self.peer.lock().unwrap() = None;
+        kResultOk
+    }
+    unsafe fn notify(&self, message: *mut IMessage) -> tresult {
+        let Some(m) = (unsafe { ComRef::from_raw(message) }) else { return kInvalidArgument };
+        let id = unsafe { std::ffi::CStr::from_ptr(m.getMessageID()) }.to_bytes().to_vec();
+        let attrs = unsafe { ComRef::from_raw(m.getAttributes()) }.expect("message attributes");
+        match id.as_slice() {
+            b"ping" => {
+                // Every attribute kind must arrive as it was sent.
+                let (mut n, mut f) = (0i64, 0f64);
+                assert_eq!(unsafe { attrs.getInt(c"n".as_ptr(), &mut n) }, kResultOk);
+                assert_eq!(unsafe { attrs.getFloat(c"f".as_ptr(), &mut f) }, kResultOk);
+                let mut text = [0 as TChar; 16];
+                assert_eq!(unsafe { attrs.getString(c"s".as_ptr(), text.as_mut_ptr(), 32) }, kResultOk);
+                let (mut data, mut size) = (std::ptr::null(), 0u32);
+                assert_eq!(unsafe { attrs.getBinary(c"b".as_ptr(), &mut data, &mut size) }, kResultOk);
+                let bin = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), size as usize) };
+                assert_ne!(unsafe { attrs.getInt(c"missing".as_ptr(), &mut n) }, kResultOk);
+                if n == 42 && f == 1.5 && text.starts_with(&wide("h\u{e9}llo")) && bin == [1, 2, 3] {
+                    self.freq.store(0.25f64.to_bits(), Ordering::Relaxed);
+                }
+            }
+            b"request" => {
+                let mut kind = 0i64;
+                assert_eq!(unsafe { attrs.getInt(c"kind".as_ptr(), &mut kind) }, kResultOk);
+                match kind {
+                    1 => {
+                        // The plugin's latency changes with its next activation: tell the processor.
+                        assert!(send_request(&self.host, &self.peer, c"latency", c"samples", 7));
+                        self.restart(RestartFlags_::kLatencyChanged as i32);
+                    }
+                    2 => {
+                        // A program change: the plugin's own values move.
+                        self.gain.store(0.9f64.to_bits(), Ordering::Relaxed);
+                        self.restart(RestartFlags_::kParamValuesChanged as i32);
+                        let handler = self.handler.lock().unwrap().as_ref().map(|h| h.0.clone()).expect("component handler");
+                        let h2 = handler.cast::<IComponentHandler2>().expect("the host handles setDirty");
+                        assert_eq!(unsafe { h2.setDirty(1) }, kResultOk);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
         kResultOk
     }
 }
@@ -421,6 +608,7 @@ impl IEditControllerTrait for GainController {
     unsafe fn setComponentHandler(&self, handler: *mut IComponentHandler) -> tresult {
         // Exercise the host's handler: an edit from the "plugin GUI" must be accepted.
         if let Some(h) = unsafe { ComRef::from_raw(handler) } {
+            *self.handler.lock().unwrap() = Some(Held(h.to_com_ptr()));
             assert_eq!(unsafe { h.beginEdit(7) }, kResultOk);
             assert_eq!(unsafe { h.performEdit(7, 0.9) }, kResultOk);
             assert_eq!(unsafe { h.endEdit(7) }, kResultOk);
@@ -691,6 +879,13 @@ impl IPluginFactoryTrait for Factory {
             ComWrapper::new(GainProcessor {
                 gain: AtomicU64::new(0.25f64.to_bits()),
                 arrangement: AtomicU64::new(SpeakerArr::kStereo),
+                main: std::thread::current().id(),
+                in_process: AtomicBool::new(false),
+                latency: AtomicU32::new(3),
+                latency_next: AtomicU32::new(3),
+                asked: AtomicBool::new(false),
+                host: Mutex::new(None),
+                peer: Mutex::new(None),
                 _live: Live::new(&OBJECTS),
             })
             .to_com_ptr::<FUnknown>()
@@ -698,6 +893,9 @@ impl IPluginFactoryTrait for Factory {
             ComWrapper::new(GainController {
                 gain: AtomicU64::new(0.5f64.to_bits()),
                 freq: AtomicU64::new(0.5f64.to_bits()),
+                host: Mutex::new(None),
+                peer: Mutex::new(None),
+                handler: Mutex::new(None),
                 _live: Live::new(&OBJECTS),
             })
             .to_com_ptr::<FUnknown>()

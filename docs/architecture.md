@@ -1,6 +1,6 @@
 # Architecture
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** trivial (delay compensation includes the master faders' inserts (#351); previously minor: bounces stream to disk) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-21 · **Change:** minor (one main-thread service point answers what hosted plugins ask of the host; previously trivial: delay compensation includes the master faders' inserts (#351)) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 SoundCraft is a Cargo workspace of small crates with enforced layering (`cargo xtask layers`).
 Nothing below the UI knows about egui, so the interface can be replaced.
@@ -62,6 +62,18 @@ and recordings are captured in memory until stop.
 for the video track. Hosted plugins (`clap-host`, `vst3-host`, `au-host`) are scanned, created and
 destroyed off the audio thread; only `process` runs on it.
 
+What a hosted plugin asks of its host (a CLAP `request_callback`, `request_restart`,
+`params.rescan`, `params.request_flush` and `state.mark_dirty`; a VST3 `restartComponent` and
+`setDirty`) is answered on the main thread by one service point, `PluginService`, which every
+hosted plugin hands out (`Plugin::service_handle`). The UI frame (`Player::idle`) services every
+live plugin whether or not its editor is open, and an offline render (`MixEngine::render`: bounces,
+the CLI) services the plugins it owns between blocks. A restart deactivates and re-activates the
+plugin there, with the audio thread parked by a `ParkGate`: for the blocks that takes the plugin
+counts as inactive and its buffers are left as they are (an effect passes its input through, an
+instrument stays silent), and the audio thread never locks or waits. A plugin's shown value, and
+the start of an automation pass on a parameter nobody set, are the live plugin's
+(`PluginService::live_param`, `soundcraft_mix::LiveParams`), never its advertised default.
+
 The cpal callbacks mark their thread (`soundcraft_playback::mark_audio_thread`). Code that may run
 there can ask `on_audio_thread()` before doing anything that blocks; the desktop app's logger does,
 so a `log::` record from the audio thread (a stream error, a full synth event queue, a hosted
@@ -78,6 +90,7 @@ app as an MCP server. See `control-protocol.md` and `mcp.md`.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-21 | minor | One main-thread service point answers what hosted plugins ask of the host |
 | 2026-10-13 | trivial | delay compensation includes the master faders' inserts (#351) |
 | 2026-10-10 | minor | Added video, vst3-host and au-host to the layer diagram; documented device I/O limits and in-memory media |
 | 2026-10-05 | major | First architecture overview |

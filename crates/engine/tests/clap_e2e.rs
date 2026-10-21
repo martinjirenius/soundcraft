@@ -40,7 +40,7 @@ fn install_fixture_now() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::copy(target.join("debug").join(lib), dir.join("Fixture.clap")).unwrap();
-    assert_eq!(soundcraft_clap_host::add_search_dir(&dir), 6);
+    assert_eq!(soundcraft_clap_host::add_search_dir(&dir), 7);
 }
 
 #[test]
@@ -168,4 +168,59 @@ fn automation_on_an_unset_plugin_param_reaches_the_plugin() {
     }
     let automated = soundcraft_mix::render_range(e.session(), Range::new(0, 4800), 512)[0][2000];
     assert!((automated - 0.5 * plain).abs() < 1e-4, "automation drives the unset gain: {automated}");
+}
+
+/// Contract: where the engine picks an automation pass's start point for a hosted parameter
+/// nobody set, the value comes from the live plugin, not from its advertised default (1.0 here;
+/// Surge XT advertises 0 for ~800 parameters). With no live plugin to ask, the pass starts from the
+/// value it writes, never from the advertised default.
+#[test]
+fn an_automation_pass_on_an_unset_hosted_param_starts_at_the_plugins_live_value() {
+    struct Live(f32);
+    impl soundcraft_mix::LiveParams for Live {
+        fn live_value(&self, _track: soundcraft_model::TrackId, slot: usize, param: &str) -> Option<f32> {
+            (slot == 0 && param == "7").then_some(self.0)
+        }
+    }
+    install_fixture();
+    let mut e = Engine::default();
+    let r = e.execute("track.new", &json!({"kind": "audio", "name": "Fx"})).unwrap();
+    let track = r["tracks"][0].as_u64().unwrap();
+    e.execute("mix.insert", &json!({"track": track, "plugin": "clap:org.soundcraft.test.gain"})).unwrap();
+    assert!(e.session().tracks[0].mixer.inserts[0].as_ref().unwrap().params.is_empty(), "nothing is stored for the plugin");
+    let write = json!({"track": track, "param": "plugin:a:7", "start": 1000, "end": 2000, "value": 0.5});
+    let before_the_pass =
+        |e: &Engine| e.session().tracks[0].lane(&soundcraft_model::AutoParam::Plugin { slot: 0, param: "7".into() }).map(|l| l.value_at(0, -9.0));
+
+    e.set_live_params(Some(Arc::new(Live(1.7))));
+    e.execute("automation.write_range", &write).unwrap();
+    assert_eq!(before_the_pass(&e), Some(1.7), "outside the pass the lane holds the plugin's live value");
+
+    e.execute("automation.clear", &json!({"track": track, "param": "plugin:a:7"})).unwrap();
+    e.set_live_params(None);
+    e.execute("automation.write_range", &write).unwrap();
+    assert_eq!(before_the_pass(&e), Some(0.5), "no live plugin: the written value, not the advertised default");
+}
+
+/// Contract: the offline path (bounce, CLI render) is a host too: the mix engine that owns the
+/// plugins answers what they ask between blocks. The requests fixture asks for a main-thread
+/// callback while processing its first block and adds 0.01 of DC for every callback it gets.
+#[test]
+fn an_offline_render_answers_what_the_plugins_ask_of_the_host() {
+    install_fixture();
+    let mut e = Engine::default();
+    let s = e.session_mut();
+    let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+    s.pool.insert(SourceId(80), Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.25; 4800]] })));
+    let id = s.new_clip_id();
+    s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "dc", SourceId(80), 0, 0, 4800));
+    // Param 20 "Request" = 2: the plugin calls `request_callback` from its first block.
+    e.execute("mix.insert", &json!({"track": t.0, "plugin": "clap:org.soundcraft.test.requests", "params": {"20": 2.0}})).unwrap();
+    let out = soundcraft_mix::render_range(e.session(), Range::new(0, 4800), 512);
+    // The track's pan law scales everything alike; the callback's 0.01 of DC shows as the difference.
+    let (first, later) = (out[0][100], out[0][4000]);
+    assert!(
+        (first / 0.25 - later / 0.26).abs() < 1e-3,
+        "the first block ran before the plugin could be called back, a later one after: {first} then {later}"
+    );
 }

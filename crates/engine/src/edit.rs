@@ -770,18 +770,25 @@ pub fn create_fades(s: &mut Session, track: TrackId, range: Range, shape: FadeSh
     let mut made = 0;
     let mut xfaded: Vec<ClipId> = Vec::new();
     let n = pl.clips.len();
+    // Starts and lengths before any crossfade grew a clip: every bound below uses these, so the
+    // outcome of one pair never depends on what the previous pair did to its shared neighbour.
+    let originals: Vec<(ClipId, Samples, Samples)> = pl.clips.iter().map(|c| (c.id, c.start, c.length)).collect();
     // Crossfades between adjacent clips whose boundary is inside the range.
     for i in 0..n.saturating_sub(1) {
         let (Some(a), Some(b)) = (pl.clips.get(i).cloned(), pl.clips.get(i + 1).cloned()) else { continue };
         let boundary = a.end();
         if b.start == boundary && range.start < boundary && range.end > boundary {
-            let before = boundary - range.start.max(a.start);
-            let after = range.end.min(b.end()) - boundary;
+            let orig = |id: ClipId| originals.iter().find(|o| o.0 == id).map_or((0, 0), |o| (o.1, o.2));
+            let ((a_start, a_len), (_, b_len)) = (orig(a.id), orig(b.id));
+            let before = boundary - range.start.max(a_start);
+            let after = range.end.min(b.start.saturating_add(b_len)) - boundary;
             let a_handle = handles.iter().find(|h| h.0 == a.id).map_or(0, |h| h.1);
             let b_handle = b.source_offset();
-            // Extend each clip into the other's territory using its handles.
-            let ext_a = after.min(a_handle).max(0);
-            let ext_b = before.min(b_handle).max(0);
+            // Extend each clip into the other's territory using its handles, but never further
+            // than half the neighbour: a clip then has room for a crossfade at each end without
+            // the two meeting, so only adjacent clips overlap and the playlist stays sorted.
+            let ext_a = after.min(a_handle).min(b_len / 2).max(0);
+            let ext_b = before.min(b_handle).min(a_len / 2).max(0);
             if let Some(ca) = pl.clips.get_mut(i) {
                 ca.length += ext_a;
                 ca.fade_out = Fade { len: (ext_a + before).min(ca.length), shape, curvature: 0.0 };
@@ -808,7 +815,9 @@ pub fn create_fades(s: &mut Session, track: TrackId, range: Range, shape: FadeSh
     made
 }
 
-/// Remove fades on clips touching `range`.
+/// Remove fades on clips touching `range`, and heal the crossfade overlaps they leave. Healing
+/// copes with any overlap (a session saved by older code may have clips stacked more than two
+/// deep): the playlist ends sorted, non-overlapping, and no clip shrinks below one sample.
 pub fn delete_fades(s: &mut Session, track: TrackId, range: Range) -> usize {
     let Some(pl) = s.track_mut(track).and_then(|t| t.playlist_mut()) else { return 0 };
     let mut n = 0;
@@ -821,21 +830,36 @@ pub fn delete_fades(s: &mut Session, track: TrackId, range: Range) -> usize {
             c.fade_out = Fade::default();
         }
     }
-    // Overlapping (crossfaded) neighbours are trimmed back to the midpoint.
-    pl.sort();
-    for i in 0..pl.clips.len().saturating_sub(1) {
-        let (Some(a_end), Some(b_start)) = (pl.clips.get(i).map(Clip::end), pl.clips.get(i + 1).map(|c| c.start)) else { continue };
-        if a_end > b_start {
-            let mid = b_start + (a_end - b_start) / 2;
-            if let Some(a) = pl.clips.get_mut(i) {
-                a.trim_end_to(mid);
-            }
-            if let Some(b) = pl.clips.get_mut(i + 1) {
-                b.trim_start_to(mid);
-            }
-        }
-    }
+    resolve_overlaps(pl);
     n
+}
+
+/// Trim overlapping neighbours back to their midpoint until none overlap. Each pass fixes the
+/// first overlapping pair and re-sorts (a trimmed start can move past later clips), so it
+/// converges for any stacking; a one-sample clip that cannot be split is dropped.
+fn resolve_overlaps(pl: &mut soundcraft_model::Playlist) {
+    pl.sort();
+    for _ in 0..pl.clips.len().saturating_mul(4).saturating_add(4) {
+        let found = pl.clips.windows(2).position(|w| w[0].end() > w[1].start);
+        let Some(i) = found else { return };
+        let (Some(a), Some(b)) = (pl.clips.get(i), pl.clips.get(i + 1)) else { return };
+        let (a_start, a_end, b_start, b_end) = (a.start, a.end(), b.start, b.end());
+        let lo = a_start.saturating_add(1);
+        let hi = b_end.saturating_sub(1);
+        if lo > hi {
+            // Nothing left to split: the later clip is a single sample inside the earlier one.
+            pl.clips.remove(i + 1);
+            continue;
+        }
+        let mid = b_start.saturating_add(a_end.saturating_sub(b_start) / 2).clamp(lo, hi);
+        if let Some(a) = pl.clips.get_mut(i) {
+            a.trim_end_to(mid);
+        }
+        if let Some(b) = pl.clips.get_mut(i + 1) {
+            b.trim_start_to(mid);
+        }
+        pl.sort();
+    }
 }
 
 #[cfg(test)]
@@ -934,6 +958,37 @@ mod tests {
         delete_fades(&mut s, t, Range::new(2900, 3100));
         let c = s.track(t).unwrap().clips();
         assert_eq!((c[0].end(), c[1].start), (3000, 3000));
+    }
+
+    #[test]
+    fn crossfades_over_three_whole_clips_overlap_only_neighbours_and_heal_sorted() {
+        let (mut s, t, _) = three_clips();
+        // Material to extend into: a clip's handle must not be what bounds the crossfade.
+        s.sources[0].frames = 100_000;
+        if let Some(pl) = s.track_mut(t).and_then(|t| t.playlist_mut()) {
+            pl.clips = vec![
+                Clip::audio(ClipId(1), "a", SourceId(500), 10_000, 10_000, 1000),
+                Clip::audio(ClipId(2), "b", SourceId(500), 11_000, 11_000, 2000),
+                Clip::audio(ClipId(3), "c", SourceId(500), 13_000, 13_000, 1000),
+            ];
+        }
+        assert_eq!(create_fades(&mut s, t, Range::new(0, 20_000), FadeShape::Linear), 2);
+        let c = s.track(t).unwrap().clips();
+        assert!(c.windows(2).all(|w| w[0].start <= w[1].start));
+        assert!(c[0].end() <= c[2].start, "only adjacent clips may overlap");
+        assert!(c.iter().all(|c| c.length > 0));
+        // An old session with the clips stacked three deep heals to a sorted, disjoint playlist.
+        if let Some(pl) = s.track_mut(t).and_then(|t| t.playlist_mut()) {
+            pl.clips = vec![
+                Clip::audio(ClipId(1), "a", SourceId(500), 0, 0, 2000),
+                Clip::audio(ClipId(2), "b", SourceId(500), 0, 0, 1500),
+                Clip::audio(ClipId(3), "c", SourceId(500), 0, 0, 1),
+            ];
+        }
+        delete_fades(&mut s, t, Range::new(0, 5000));
+        let c = s.track(t).unwrap().clips();
+        assert!(c.windows(2).all(|w| w[0].end() <= w[1].start), "{c:?}");
+        assert!(c.iter().all(|c| c.length > 0));
     }
 
     fn three_clips() -> (Session, TrackId, [ClipId; 3]) {

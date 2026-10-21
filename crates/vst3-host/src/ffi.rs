@@ -1075,6 +1075,7 @@ pub(crate) struct RawParam {
 pub(crate) const PARAM_HIDDEN: i32 = sv::ParameterInfo_::ParameterFlags_::kIsHidden;
 pub(crate) const PARAM_READ_ONLY: i32 = sv::ParameterInfo_::ParameterFlags_::kIsReadOnly;
 pub(crate) const PARAM_BYPASS: i32 = sv::ParameterInfo_::ParameterFlags_::kIsBypass;
+pub(crate) const PARAM_PROGRAM_CHANGE: i32 = sv::ParameterInfo_::ParameterFlags_::kIsProgramChange;
 
 /// The audio bus layout chosen by [`Instance::configure`].
 #[derive(Debug, Clone, Default, PartialEq)]

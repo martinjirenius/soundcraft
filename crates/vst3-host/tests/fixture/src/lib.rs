@@ -64,6 +64,15 @@ unsafe fn channels<'a>(bus: &AudioBusBuffers, frames: usize) -> Vec<&'a mut [f32
 
 // ---- gain ----------------------------------------------------------------------------------
 
+/// Parameter points the gain processor has been sent (read by tests through `fixture_param_points`).
+static PARAM_POINTS: AtomicU64 = AtomicU64::new(0);
+
+/// What the host has written to the gain processor so far: one count per parameter point.
+#[unsafe(no_mangle)]
+pub extern "C" fn fixture_param_points() -> u64 {
+    PARAM_POINTS.load(Ordering::SeqCst)
+}
+
 struct GainProcessor {
     /// Normalized gain (plain = 2 × normalized).
     gain: AtomicU64,
@@ -188,6 +197,7 @@ impl IAudioProcessorTrait for GainProcessor {
                 let Some(q) = (unsafe { ComRef::from_raw(changes.getParameterData(i)) }) else { continue };
                 let (mut off, mut v) = (0, 0.0);
                 let n = unsafe { q.getPointCount() };
+                PARAM_POINTS.fetch_add(n.max(0) as u64, Ordering::SeqCst);
                 if unsafe { q.getParameterId() } == 7 && n > 0 && unsafe { q.getPoint(n - 1, &mut off, &mut v) } == kResultOk {
                     self.gain.store(v.to_bits(), Ordering::Relaxed);
                 }

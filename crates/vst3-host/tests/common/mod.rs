@@ -21,13 +21,7 @@ pub fn fixture_dir() -> &'static Path {
             .status()
             .expect("run cargo");
         assert!(st.success(), "building the VST3 fixture failed");
-        let (lib, folder, exe) = if cfg!(target_os = "macos") {
-            ("libvst3_fixture.dylib", "MacOS", "Fixture")
-        } else if cfg!(windows) {
-            ("vst3_fixture.dll", "x86_64-win", "Fixture.vst3")
-        } else {
-            ("libvst3_fixture.so", if cfg!(target_arch = "aarch64") { "aarch64-linux" } else { "x86_64-linux" }, "Fixture.so")
-        };
+        let (lib, folder, exe) = bundle_layout();
         let built = target.join("debug").join(lib);
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("vst3-fixture-install-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -38,4 +32,22 @@ pub fn fixture_dir() -> &'static Path {
         assert_eq!(soundcraft_vst3_host::add_search_dir(&dir), 2);
         dir
     })
+}
+
+/// The installed fixture library itself (inside the bundle [`fixture_dir`] made).
+#[allow(dead_code)] // only the param_resend test loads the library directly
+pub fn fixture_binary() -> PathBuf {
+    let (_, folder, exe) = bundle_layout();
+    fixture_dir().join("vendor/Fixture.vst3/Contents").join(folder).join(exe)
+}
+
+/// The cargo build's library name, the bundle's binary folder and the bundle's binary name.
+fn bundle_layout() -> (&'static str, &'static str, &'static str) {
+    if cfg!(target_os = "macos") {
+        ("libvst3_fixture.dylib", "MacOS", "Fixture")
+    } else if cfg!(windows) {
+        ("vst3_fixture.dll", "x86_64-win", "Fixture.vst3")
+    } else {
+        ("libvst3_fixture.so", if cfg!(target_arch = "aarch64") { "aarch64-linux" } else { "x86_64-linux" }, "Fixture.so")
+    }
 }

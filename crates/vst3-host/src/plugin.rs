@@ -1,6 +1,8 @@
 //! `Vst3Plugin`: a loaded VST3 instance behind the safe `soundcraft_dsp::Plugin` trait.
 
-use crate::ffi::{AFTERTOUCH, BusBuffers, EVENT_CAP, EditorLink, HostContext, Instance, NoteEvent, PARAM_QUEUE_CAP, PITCH_BEND};
+use crate::ffi::{
+    AFTERTOUCH, BusBuffers, EVENT_CAP, EditorLink, HostContext, Instance, NoteEvent, PARAM_PROGRAM_CHANGE, PARAM_QUEUE_CAP, PITCH_BEND,
+};
 use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, Transport, Unit};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,6 +36,12 @@ pub struct Vst3Plugin {
     ids: Vec<u32>,
     maps: Vec<Mapping>,
     values: Vec<f32>,
+    /// Whether the host has set each parameter (same order as `ids`). Only those are re-sent when
+    /// the plugin is re-activated; the rest are the plugin's own values.
+    host_set: Vec<bool>,
+    /// Whether each parameter is a program change (VST3 `kIsProgramChange`, same order as `ids`).
+    /// Never re-sent: that would reload a patch over the plugin's own edits.
+    program_change: Vec<bool>,
     /// Normalized values waiting for the next block (coalesced per id; bounded).
     pending: Vec<(u32, f64)>,
     /// Host-set normalized values the controller has not seen yet (same order as `ids`; the bits
@@ -84,9 +92,13 @@ impl Vst3Plugin {
                 }
             })
             .collect();
+        let raw = inst.params();
+        let program_change: Vec<bool> = ids.iter().map(|id| raw.iter().any(|r| r.id == *id && r.flags & PARAM_PROGRAM_CHANGE != 0)).collect();
         let mut p = Vst3Plugin {
             info,
             values: Vec::with_capacity(ids.len()),
+            host_set: vec![false; ids.len()],
+            program_change,
             pending: Vec::with_capacity(ids.len().min(PARAM_QUEUE_CAP)),
             unsynced: ids.iter().map(|_| AtomicU64::new(SYNCED)).collect(),
             notes: Vec::with_capacity(EVENT_CAP),
@@ -161,6 +173,8 @@ impl Vst3Plugin {
             }
         }
         self.pending.clear();
+        // A loaded state is the plugin's own again: nothing the host set is re-sent over it.
+        self.host_set.fill(false);
         for u in self.unsynced.iter() {
             u.store(SYNCED, Ordering::Relaxed);
         }
@@ -204,9 +218,13 @@ impl Plugin for Vst3Plugin {
                 self.latency = 0;
             }
         }
-        // Re-send every value so a re-activated plugin matches the session.
+        // Re-send the values the host set so a re-activated plugin matches the session. A value only
+        // the plugin set is its own, and a program change is never re-sent.
         self.pending.clear();
         for i in 0..self.ids.len().min(PARAM_QUEUE_CAP) {
+            if !self.host_set.get(i).copied().unwrap_or(false) || self.program_change.get(i).copied().unwrap_or(true) {
+                continue;
+            }
             if let (Some(&id), Some(n)) = (self.ids.get(i), self.values.get(i).and_then(|&v| self.normalized_from_plain(i, v))) {
                 self.pending.push((id, n));
             }
@@ -225,6 +243,9 @@ impl Plugin for Vst3Plugin {
         let v = pi.clamp(value);
         if let Some(slot) = self.values.get_mut(i) {
             *slot = v;
+        }
+        if let Some(h) = self.host_set.get_mut(i) {
+            *h = true;
         }
         let Some(n) = self.normalized_from_plain(i, v) else { return true };
         if let Some(u) = self.unsynced.get(i) {

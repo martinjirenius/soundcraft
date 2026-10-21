@@ -27,6 +27,64 @@ enum Mapping {
     Linear,
 }
 
+/// Points of a sampled normalized→plain curve (`CURVE_STEPS + 1`).
+const CURVE_STEPS: usize = 256;
+
+/// How `set_param` turns a plain value into a normalized one. Unlike [`Mapping`] it never asks the
+/// controller: `set_param` runs on the audio thread, and VST3 controller calls belong to the main
+/// thread. The tables are sampled in `Vst3Plugin::new`.
+#[derive(Debug, Clone, PartialEq)]
+enum AudioMap {
+    Stepped(f64),
+    /// Linear over the info range.
+    Linear,
+    /// The controller's normalized→plain curve at `k / CURVE_STEPS`, non-decreasing.
+    Table(Box<[f64]>),
+}
+
+impl AudioMap {
+    /// Classifies a sampled curve over the info range `min..=max`: linear within tolerance (the
+    /// identity-mapped JUCE parameters), a monotonic table, or `Err` with the reason it is neither.
+    fn from_samples(table: Vec<f64>, min: f64, max: f64) -> Result<AudioMap, &'static str> {
+        if table.len() != CURVE_STEPS + 1 || table.iter().any(|v| !v.is_finite()) {
+            return Err("the controller gave no finite plain value for some normalized value");
+        }
+        let span = max - min;
+        if span > 0.0 && table.iter().enumerate().all(|(k, &v)| (v - (min + span * k as f64 / CURVE_STEPS as f64)).abs() <= 1e-4 * span) {
+            return Ok(AudioMap::Linear);
+        }
+        let rising = table.last().zip(table.first()).is_some_and(|(hi, lo)| hi > lo);
+        if !rising || table.windows(2).any(|w| w[1] < w[0]) {
+            return Err("its normalized-to-plain curve is not monotonic and rising");
+        }
+        Ok(AudioMap::Table(table.into_boxed_slice()))
+    }
+}
+
+/// Inverts a non-decreasing sampled curve: binary search, then interpolation within the segment. No allocation.
+fn invert_curve(table: &[f64], plain: f64) -> f64 {
+    let last = table.len().saturating_sub(1);
+    if last == 0 {
+        return 0.0;
+    }
+    // First sample that is not below `plain`.
+    let k = table.partition_point(|&x| x < plain);
+    if k == 0 {
+        return 0.0;
+    }
+    let (Some(&a), Some(&b)) = (table.get(k - 1), table.get(k)) else { return 1.0 };
+    // Within a segment a positive curve (frequencies, times) is closer to geometric than to
+    // linear, so interpolate geometrically there: 256 points then invert a log curve exactly.
+    let frac = if b > a && a > 0.0 && plain > 0.0 {
+        (plain / a).ln() / (b / a).ln()
+    } else if b > a {
+        (plain - a) / (b - a)
+    } else {
+        0.0
+    };
+    ((k - 1) as f64 + frac) / last as f64
+}
+
 /// A hosted VST3 plugin. Parameter ids are VST3 `ParamID`s as decimal strings ("0", "17", …);
 /// values are plain (display) values with their names and ranges in `info().params`.
 pub struct Vst3Plugin {
@@ -35,6 +93,8 @@ pub struct Vst3Plugin {
     /// VST3 id of each `info.params` entry (same order).
     ids: Vec<u32>,
     maps: Vec<Mapping>,
+    /// What `set_param` converts with (never the controller; see [`AudioMap`]).
+    audio_maps: Vec<AudioMap>,
     values: Vec<f32>,
     /// Whether the host has set each parameter (same order as `ids`). Only those are re-sent when
     /// the plugin is re-activated; the rest are the plugin's own values.
@@ -101,6 +161,23 @@ impl Vst3Plugin {
                 }
             })
             .collect();
+        let audio_maps: Vec<AudioMap> = info
+            .params
+            .iter()
+            .zip(&ids)
+            .zip(&maps)
+            .map(|((p, &id), m)| match m {
+                Mapping::Stepped(steps) => AudioMap::Stepped(*steps),
+                Mapping::Linear => AudioMap::Linear,
+                Mapping::Plain => {
+                    let table: Vec<f64> = (0..=CURVE_STEPS).map(|k| inst.to_plain(id, k as f64 / CURVE_STEPS as f64).unwrap_or(f64::NAN)).collect();
+                    AudioMap::from_samples(table, f64::from(p.min), f64::from(p.max)).unwrap_or_else(|why| {
+                        log::warn!("{}: parameter {} is set linearly over its range: {why}", info.id, p.id);
+                        AudioMap::Linear
+                    })
+                }
+            })
+            .collect();
         let raw = inst.params();
         let program_change: Vec<bool> = ids.iter().map(|id| raw.iter().any(|r| r.id == *id && r.flags & PARAM_PROGRAM_CHANGE != 0)).collect();
         let mut p = Vst3Plugin {
@@ -130,6 +207,7 @@ impl Vst3Plugin {
             restarts_seen: 0,
             ids,
             maps,
+            audio_maps,
             inst,
         };
         let values: Vec<f32> = (0..p.ids.len())
@@ -153,16 +231,17 @@ impl Vst3Plugin {
         v.is_finite().then_some(v as f32)
     }
 
+    /// Plain → normalized from the tables sampled at construction, so it is safe on the audio
+    /// thread (no controller call, no allocation).
     fn normalized_from_plain(&self, i: usize, v: f32) -> Option<f64> {
         let pi = self.info.params.get(i)?;
-        let id = *self.ids.get(i)?;
         let span = f64::from(pi.max - pi.min);
         let linear = if span > 0.0 { (f64::from(v) - f64::from(pi.min)) / span } else { 0.0 };
-        let n = match self.maps.get(i)? {
-            Mapping::Stepped(steps) if *steps > 0.0 => f64::from(v) / steps,
-            Mapping::Stepped(_) => 0.0,
-            Mapping::Plain => self.inst.to_normalized(id, f64::from(v)).unwrap_or(linear),
-            Mapping::Linear => linear,
+        let n = match self.audio_maps.get(i)? {
+            AudioMap::Stepped(steps) if *steps > 0.0 => f64::from(v) / steps,
+            AudioMap::Stepped(_) => 0.0,
+            AudioMap::Table(t) => invert_curve(t, f64::from(v)),
+            AudioMap::Linear => linear,
         };
         n.is_finite().then(|| n.clamp(0.0, 1.0))
     }
@@ -624,5 +703,33 @@ impl PluginEditor for Vst3Editor {
         // but some plugins put them in both.
         let units = self.units.get(i).map_or("", |u| u.trim());
         if units.is_empty() || text.trim_end().to_lowercase().ends_with(&units.to_lowercase()) { Some(text) } else { Some(format!("{text} {units}")) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Protects the audio-thread plain -> normalized conversion: a sampled log (frequency) curve,
+    // inverted by table search, round-trips within 1e-6 of the value across the whole range (geometric interpolation is exact for it).
+    #[test]
+    fn table_inversion_follows_a_log_curve() {
+        let (lo, hi) = (20.0_f64, 20_000.0_f64);
+        let plain = |n: f64| lo * (hi / lo).powf(n);
+        let table: Vec<f64> = (0..=CURVE_STEPS).map(|k| plain(k as f64 / CURVE_STEPS as f64)).collect();
+        let AudioMap::Table(t) = AudioMap::from_samples(table, lo, hi).unwrap() else { panic!("a log curve is not linear") };
+        for k in 0..=1000 {
+            let n = f64::from(k) / 1000.0;
+            let v = plain(n);
+            let back = plain(invert_curve(&t, v));
+            assert!((back - v).abs() <= 1e-6 * v, "n={n}: {v} came back as {back}");
+        }
+        assert_eq!(invert_curve(&t, lo - 5.0), 0.0);
+        assert_eq!(invert_curve(&t, hi + 5.0), 1.0);
+        let line: Vec<f64> = (0..=CURVE_STEPS).map(|k| k as f64 / CURVE_STEPS as f64).collect();
+        assert_eq!(AudioMap::from_samples(line, 0.0, 1.0), Ok(AudioMap::Linear));
+        let mut bent: Vec<f64> = (0..=CURVE_STEPS).map(|k| (k * k) as f64).collect();
+        bent.swap(10, 11);
+        assert!(AudioMap::from_samples(bent, 0.0, 65536.0).is_err());
     }
 }

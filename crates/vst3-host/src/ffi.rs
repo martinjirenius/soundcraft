@@ -1599,8 +1599,9 @@ pub(crate) struct Instance {
 
 // SAFETY: an `Instance` is used through `&mut self` only, so calls into the plugin are always
 // serialised. SoundCraft creates instances on the engine/UI thread and then moves them into the
-// mix engine (documented limitation: VST3 expects `setActive`, controller calls etc. on the UI
-// thread; they may then happen on the audio thread).
+// mix engine. VST3 expects `setActive` and controller calls on the UI thread: `configure` runs
+// only from `prepare` or the main-thread restart service, `set_param` converts values through
+// tables built at creation, and instances are released on the main thread.
 unsafe impl Send for Instance {}
 
 impl Instance {
@@ -1704,17 +1705,6 @@ impl Instance {
         // SAFETY: valid controller.
         let v = unsafe { c.normalizedParamToPlain(id, normalized.clamp(0.0, 1.0)) };
         v.is_finite().then_some(v)
-    }
-
-    /// Plain → normalized, clamped to 0..1.
-    pub fn to_normalized(&self, id: u32, plain: f64) -> Option<f64> {
-        let c = self.controller.as_ref()?;
-        if !plain.is_finite() {
-            return None;
-        }
-        // SAFETY: valid controller.
-        let v = unsafe { c.plainParamToNormalized(id, plain) };
-        v.is_finite().then(|| v.clamp(0.0, 1.0))
     }
 
     pub fn normalized_value(&self, id: u32) -> Option<f64> {

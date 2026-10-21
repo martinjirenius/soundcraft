@@ -166,3 +166,24 @@ fn live_param_is_the_plugins_value_not_its_advertised_default() {
     assert_eq!(svc.live_param("7"), Some(1.0), "live");
     assert_eq!(svc.live_param("no-such"), None);
 }
+
+#[test]
+// Contract: `clap.thread-check` tells a plugin the truth: on the creating thread it is the main
+// thread and not the audio thread; inside `process` (here on another thread) it is the audio
+// thread and not the main thread.
+fn thread_check_tells_main_from_audio() {
+    let mut p = requests();
+    let mut svc = p.service_handle().expect("service handle");
+    trigger(&mut p, 10);
+    assert_eq!(svc.live_param("23"), Some(11.0), "on the main thread: main = true, audio = false");
+    assert_eq!(svc.live_param("24"), Some(0.0), "not asked in process yet");
+    let p = std::thread::spawn(move || {
+        let mut io = vec![vec![0.5f32; 64]; 2];
+        p.process(&mut io, 64);
+        p
+    })
+    .join()
+    .expect("audio thread");
+    assert_eq!(svc.live_param("24"), Some(12.0), "in process: main = false, audio = true");
+    drop(p);
+}

@@ -200,6 +200,23 @@ struct AudioState {
     old_sessions: Option<SyncSender<Arc<Session>>>,
 }
 
+impl Drop for AudioState {
+    /// Every plugin this state still holds goes back to the main thread to be released: the state
+    /// is dropped on the audio (or clock) thread, which must never deactivate or destroy a plugin.
+    fn drop(&mut self) {
+        let mut plugins = self.mix.drain_plugins();
+        // Instances sent but never adopted are still queued.
+        while let Ok(c) = self.rx.try_recv() {
+            if let Cmd::Session(_, instances) = c {
+                plugins.extend(instances.into_iter().map(|i| i.plugin));
+            }
+        }
+        if !plugins.is_empty() {
+            let _ = self.garbage.send(plugins);
+        }
+    }
+}
+
 fn new_engine(sr: f32) -> MixEngine {
     let mut m = MixEngine::new(sr, BLOCK);
     m.set_external_instances(true);
@@ -508,6 +525,23 @@ impl Side {
     }
 }
 
+impl Drop for Player {
+    /// Releases every plugin on the calling (main) thread: the stream and the clock thread are
+    /// stopped first (each hands its plugins to the garbage channel as its state drops), then the
+    /// main thread collects them.
+    fn drop(&mut self) {
+        drop(self._stream.take());
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((stop, handle)) = self.clock.take() {
+            stop.store(true, Ordering::Release);
+            if handle.join().is_err() {
+                log::warn!("the silent clock thread panicked");
+            }
+        }
+        self.side.get_mut().unwrap_or_else(PoisonError::into_inner).collect_garbage();
+    }
+}
+
 /// The transport and audio device.
 pub struct Player {
     shared: Arc<Shared>,
@@ -521,6 +555,9 @@ pub struct Player {
     _stream: Option<cpal::Stream>,
     #[cfg(target_arch = "wasm32")]
     _stream: Option<cpal::Stream>,
+    /// The silent clock thread and its stop flag (joined when the player drops).
+    #[cfg(not(target_arch = "wasm32"))]
+    clock: Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>,
     pub device_name: String,
     pub device_rate: u32,
     /// Output channels the device was opened with (0 for the silent clock).
@@ -620,6 +657,8 @@ impl Player {
                             tx,
                             side: new_side(grx),
                             _stream: Some(stream),
+                            #[cfg(not(target_arch = "wasm32"))]
+                            clock: None,
                             device_name: name,
                             device_rate: rate,
                             device_channels: config.channels,
@@ -669,6 +708,8 @@ impl Player {
         let mut state = AudioState::new(rx, Arc::clone(&shared), session, f64::from(rate), gtx);
         let fault = Arc::new(Fault::default());
         let failed = Arc::clone(&fault);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
         let spawn = std::thread::Builder::new().name("soundcraft-clock".into()).spawn(move || {
             let mut buf = vec![0.0f32; 4096];
             let mut last = std::time::Instant::now();
@@ -682,14 +723,18 @@ impl Player {
                     let shared = Arc::clone(&state.shared);
                     guarded_block(&failed, &shared, b, |b| state.fill(b, 2));
                 }
-                if Arc::strong_count(&state.shared) <= 1 {
+                if stopped.load(Ordering::Acquire) {
                     break;
                 }
             }
         });
-        if let Err(e) = spawn {
-            log::warn!("clock thread failed: {e}");
-        }
+        let clock = match spawn {
+            Ok(handle) => Some((stop, handle)),
+            Err(e) => {
+                log::warn!("clock thread failed: {e}");
+                None
+            }
+        };
         Player {
             shared,
             fault,
@@ -697,6 +742,7 @@ impl Player {
             tx,
             side,
             _stream: None,
+            clock,
             device_name: "No audio device (silent)".into(),
             device_rate: rate,
             device_channels: 0,
@@ -1395,6 +1441,75 @@ mod tests {
         tx.send(Cmd::Session(Arc::new(s44), Vec::new())).unwrap();
         st.fill(&mut out, 2);
         assert_eq!(grx.try_recv().unwrap().len(), 1);
+    }
+
+    /// A gain that records the thread it is dropped on.
+    struct Probe(Box<dyn Plugin>, Arc<Mutex<Vec<std::thread::ThreadId>>>);
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.1.lock().unwrap_or_else(PoisonError::into_inner).push(std::thread::current().id());
+        }
+    }
+
+    impl Plugin for Probe {
+        fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
+            self.0.info()
+        }
+        fn prepare(&mut self, sr: f32, mb: usize, ch: usize) {
+            self.0.prepare(sr, mb, ch);
+        }
+        fn reset(&mut self) {
+            self.0.reset();
+        }
+        fn set_param(&mut self, id: &str, v: f32) -> bool {
+            self.0.set_param(id, v)
+        }
+        fn param(&self, id: &str) -> Option<f32> {
+            self.0.param(id)
+        }
+        fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+            self.0.process(io, frames);
+        }
+    }
+
+    // Protects "every plugin is released on the main thread": a Player on the silent clock that
+    // holds one adopted plugin and one still queued drops both on the thread that dropped the
+    // Player, not on the clock thread.
+    #[test]
+    fn dropping_a_player_releases_its_plugins_on_the_calling_thread() {
+        use soundcraft_model::{ChannelFormat, Insert, TrackKind};
+        let mut s = soundcraft_model::Session::default();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+        s.track_mut(t).unwrap().mixer.inserts[1] = Some(Insert::new("clap:test.fake"));
+        let tag = s.track(t).unwrap().mixer.inserts[1].as_ref().unwrap().instance;
+        let s = Arc::new(s);
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+        });
+        let (tx, rx) = channel();
+        let (gtx, grx) = channel();
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let probe = |slot| PreparedInstance {
+            track: t,
+            slot,
+            id: "clap:test.fake".into(),
+            ch: 2,
+            instance: tag,
+            plugin: Box::new(Probe(soundcraft_dsp::create("gain").unwrap(), Arc::clone(&dropped))),
+        };
+        let player = Player::silent_clock_with(shared, tx, rx, Arc::clone(&s), Mutex::new(Side::new(48_000.0, grx)), gtx);
+        player.tx.send(Cmd::Session(Arc::clone(&s), vec![probe(1)])).unwrap();
+        // Let the clock thread adopt and place it, then queue a second one just before the drop.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        player.tx.send(Cmd::Session(Arc::clone(&s), vec![probe(2)])).unwrap();
+        drop(player);
+        let ids = dropped.lock().unwrap().clone();
+        assert_eq!(ids.len(), 2, "both plugins were released");
+        assert!(ids.iter().all(|id| *id == std::thread::current().id()), "released off the main thread");
     }
 
     #[test]

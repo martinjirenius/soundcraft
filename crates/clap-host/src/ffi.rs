@@ -29,6 +29,7 @@ use clap_sys::ext::params::{
     clap_param_rescan_flags, clap_plugin_params,
 };
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state, clap_plugin_state};
+use clap_sys::ext::thread_check::{CLAP_EXT_THREAD_CHECK, clap_host_thread_check};
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
 use clap_sys::fixedpoint::{CLAP_BEATTIME_FACTOR, CLAP_SECTIME_FACTOR};
 use clap_sys::host::clap_host;
@@ -38,6 +39,7 @@ use clap_sys::process::{CLAP_PROCESS_ERROR, clap_process};
 use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::version::{CLAP_VERSION, clap_version_is_compatible};
 use soundcraft_dsp::{ParkGate, Transport};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::{Path, PathBuf};
@@ -227,6 +229,8 @@ impl Bundle {
         let create = self.factory().create_plugin.ok_or_else(|| err("factory cannot create plugins"))?;
         let cid = CString::new(plugin_id).map_err(|_| err("id contains NUL"))?;
         let state = Arc::new(HostState::default());
+        // The thread that creates the instance is its main thread (`clap.thread-check`).
+        state.main_thread.store(thread_token(), Ordering::Relaxed);
         let host = Box::new(clap_host {
             clap_version: CLAP_VERSION,
             host_data: Arc::as_ptr(&state).cast_mut().cast::<c_void>(),
@@ -363,6 +367,43 @@ pub(crate) struct HostState {
     /// Parameter changes the plugin reported (output events: typically edits in its GUI),
     /// waiting for the UI. Bounded by `EDIT_CAP`; the audio thread only `try_lock`s it.
     pub edits: Mutex<Vec<(u32, f64)>>,
+    /// [`thread_token`] of the thread that created the instance (0 = not recorded).
+    pub main_thread: AtomicU64,
+}
+
+thread_local! {
+    /// This thread's token (0 until first asked). A `const`-initialised `Cell` allocates nothing.
+    static THREAD_TOKEN: Cell<u64> = const { Cell::new(0) };
+    /// The `HostState` whose `process` is running on this thread (its address; 0 = none).
+    static IN_PROCESS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// A process-unique non-zero number for the calling thread. Lock-free and allocation-free
+/// (`std::thread::current` may allocate on a thread std did not start).
+fn thread_token() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    THREAD_TOKEN.with(|t| {
+        if t.get() == 0 {
+            t.set(NEXT.fetch_add(1, Ordering::Relaxed));
+        }
+        t.get()
+    })
+}
+
+/// Marks `process` of one instance as running on this thread until dropped.
+struct InProcess(usize);
+
+impl InProcess {
+    fn enter(state: &HostState) -> InProcess {
+        let me = std::ptr::from_ref(state) as usize;
+        InProcess(IN_PROCESS.with(|c| c.replace(me)))
+    }
+}
+
+impl Drop for InProcess {
+    fn drop(&mut self) {
+        IN_PROCESS.with(|c| c.set(self.0));
+    }
 }
 
 impl Default for HostState {
@@ -393,6 +434,7 @@ impl Default for HostState {
             gui_hide: AtomicBool::new(false),
             gui_resize: AtomicU64::new(0),
             edits: Mutex::new(Vec::with_capacity(EDIT_CAP)),
+            main_thread: AtomicU64::new(0),
         }
     }
 }
@@ -528,7 +570,22 @@ static HOST_GUI: clap_host_gui = clap_host_gui {
 static HOST_LOG: clap_host_log = clap_host_log { log: Some(host_log) };
 static HOST_PARAMS: clap_host_params =
     clap_host_params { rescan: Some(host_params_rescan), clear: Some(host_params_clear), request_flush: Some(host_params_request_flush) };
+static HOST_THREAD_CHECK: clap_host_thread_check =
+    clap_host_thread_check { is_main_thread: Some(host_is_main_thread), is_audio_thread: Some(host_is_audio_thread) };
 static HOST_LATENCY: clap_host_latency = clap_host_latency { changed: Some(host_latency_changed) };
+
+/// `clap.thread-check`: the thread that created the instance. Never allocates or locks.
+unsafe extern "C" fn host_is_main_thread(host: *const clap_host) -> bool {
+    // SAFETY: the plugin passes back the host pointer we gave it.
+    unsafe { state(host) }.is_some_and(|s| s.main_thread.load(Ordering::Relaxed) == thread_token())
+}
+
+/// `clap.thread-check`: true while this instance's `start_processing`, `process` or `reset` runs on the calling thread.
+/// Never allocates or locks.
+unsafe extern "C" fn host_is_audio_thread(host: *const clap_host) -> bool {
+    // SAFETY: the plugin passes back the host pointer we gave it.
+    unsafe { state(host) }.is_some_and(|s| IN_PROCESS.with(Cell::get) == std::ptr::from_ref(s) as usize)
+}
 
 unsafe extern "C" fn host_get_extension(_host: *const clap_host, id: *const c_char) -> *const c_void {
     if id.is_null() {
@@ -546,8 +603,10 @@ unsafe extern "C" fn host_get_extension(_host: *const clap_host, id: *const c_ch
         (&HOST_STATE as *const clap_host_state).cast()
     } else if id == CLAP_EXT_GUI {
         (&HOST_GUI as *const clap_host_gui).cast()
+    } else if id == CLAP_EXT_THREAD_CHECK {
+        (&HOST_THREAD_CHECK as *const clap_host_thread_check).cast()
     } else {
-        // Everything else (thread-check, timers, fd support, …) is unsupported: CLAP allows null.
+        // Everything else (timers, fd support, …) is unsupported: CLAP allows null.
         std::ptr::null()
     }
 }
@@ -1504,6 +1563,9 @@ impl Raw {
         if st.processing.swap(false, Ordering::AcqRel)
             && let Some(f) = self.vt().stop_processing
         {
+            // `stop_processing` is an audio-thread call; here the host has parked (or stopped) the
+            // audio thread, so the calling thread stands in for it.
+            let _in_process = InProcess::enter(st);
             // SAFETY: valid instance in the processing state.
             unsafe { f(self.plugin) };
         }
@@ -1715,6 +1777,7 @@ impl Instance {
         if self.is_active()
             && let Some(f) = self.vt().reset
         {
+            let _in_process = InProcess::enter(&self.state);
             // SAFETY: valid, active instance.
             unsafe { f(self.plugin) };
         }
@@ -1732,7 +1795,10 @@ impl Instance {
         offset: u32,
         transport: Option<&Transport>,
     ) -> Result<i32, Fault> {
+        // `start_processing` and `process` are audio-thread calls: `clap.thread-check` says so.
+        let in_process = InProcess::enter(&self.state);
         let r = self.process_block(frames, steady_time, inputs, outputs, events, offset, transport);
+        drop(in_process);
         if let Err(f) = r {
             // The reason for the service to log (the first one stands until it is reported), and
             // the flag the mixer reads. No allocation, no lock.

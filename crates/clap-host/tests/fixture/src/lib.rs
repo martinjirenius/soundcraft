@@ -29,7 +29,10 @@
 //!   4 `state.mark_dirty`, 5 `params.request_flush` (the next flush reports a GUI edit of the
 //!   gain to 0.25). Params 21 "Callbacks" and 22 "Activations" count `on_main_thread` calls and
 //!   `activate` calls, so a test reads them with the plugin's live values; every callback also
-//!   adds 0.01 of DC to its output, so a test hears that the host called back.
+//!   adds 0.01 of DC to its output, so a test hears that the host called back. Request 10 (and
+//!   every `process`) asks the host's `clap.thread-check` and records `10 + is_main_thread +
+//!   2 * is_audio_thread` (9 when the host has no such extension), read from params 23 "Asked on
+//!   main" and 24 "Asked in process".
 //!
 //! Every fixture is strict about threads: `activate`, `deactivate` and `on_main_thread` must run
 //! on the thread that created the plugin (the main thread), and neither `activate`, `deactivate`
@@ -46,6 +49,7 @@ use clap_sys::events::*;
 use clap_sys::ext::audio_ports::*;
 use clap_sys::ext::gui::*;
 use clap_sys::ext::state::*;
+use clap_sys::ext::thread_check::*;
 use clap_sys::stream::*;
 use clap_sys::ext::latency::*;
 use clap_sys::ext::log::*;
@@ -145,6 +149,19 @@ struct Fx {
     activations: u32,
     last_request: f64,
     flush_edit: bool,
+    /// What `clap.thread-check` answered (see the module docs); 0 = not asked yet.
+    asked_main: f64,
+    asked_process: f64,
+}
+
+/// Asks the host's `clap.thread-check` from the calling thread.
+unsafe fn ask_thread_check(f: &Fx) -> f64 {
+    let host = unsafe { &*f.host };
+    let tc = unsafe { (host.get_extension.unwrap())(f.host, CLAP_EXT_THREAD_CHECK.as_ptr()) } as *const clap_host_thread_check;
+    let Some(tc) = (unsafe { tc.as_ref() }) else { return 9.0 };
+    let m = unsafe { (tc.is_main_thread.unwrap())(f.host) };
+    let a = unsafe { (tc.is_audio_thread.unwrap())(f.host) };
+    10.0 + f64::from(u8::from(m)) + 2.0 * f64::from(u8::from(a))
 }
 
 unsafe fn fx<'a>(p: *const clap_plugin) -> &'a mut Fx {
@@ -246,6 +263,7 @@ unsafe fn request(f: &mut Fx, kind: u8) {
             unsafe { (host.request_restart.unwrap())(f.host) };
         }
         2 => unsafe { (host.request_callback.unwrap())(f.host) },
+        10 => f.asked_main = unsafe { ask_thread_check(f) },
         3 => {
             f.gain = 1.5;
             let hp = unsafe { (ext(CLAP_EXT_PARAMS) as *const clap_host_params).as_ref() }.expect("host params extension");
@@ -366,6 +384,9 @@ unsafe fn process_block(p: *const clap_plugin, pr: *const clap_process) -> clap_
     let f = unsafe { fx(p) };
     let pr = unsafe { &*pr };
     assert!(f.processing, "process while not processing");
+    if f.requests {
+        f.asked_process = unsafe { ask_thread_check(f) };
+    }
     let n = pr.frames_count as usize;
     let ev = unsafe { &*pr.in_events };
     let count = unsafe { (ev.size.unwrap())(pr.in_events) };
@@ -477,7 +498,7 @@ unsafe extern "C" fn params_count(p: *const clap_plugin) -> u32 {
     if f.synth {
         1
     } else if f.requests {
-        4
+        6
     } else {
         3
     }
@@ -499,6 +520,8 @@ unsafe extern "C" fn params_get_info(p: *const clap_plugin, index: u32, info: *m
         1 if f.requests => (20, c"Request", CLAP_PARAM_IS_STEPPED, 0.0, 9.0, 0.0),
         2 if f.requests => (21, c"Callbacks", CLAP_PARAM_IS_AUTOMATABLE, 0.0, 1000.0, 0.0),
         3 if f.requests => (22, c"Activations", CLAP_PARAM_IS_AUTOMATABLE, 0.0, 1000.0, 0.0),
+        4 if f.requests => (23, c"Asked on main", CLAP_PARAM_IS_AUTOMATABLE, 0.0, 20.0, 0.0),
+        5 if f.requests => (24, c"Asked in process", CLAP_PARAM_IS_AUTOMATABLE, 0.0, 20.0, 0.0),
         0 if synth => (7, c"Volume", CLAP_PARAM_IS_AUTOMATABLE, 0.0, 2.0, 0.0),
         0 => (7, c"Gain", CLAP_PARAM_IS_AUTOMATABLE, 0.0, 2.0, 1.0),
         1 if !f.requests => (3, c"Mode", CLAP_PARAM_IS_STEPPED | CLAP_PARAM_IS_ENUM, 0.0, 2.0, 0.0),
@@ -525,6 +548,8 @@ unsafe extern "C" fn params_get_value(p: *const clap_plugin, id: clap_id, out: *
         20 if f.requests => f.last_request,
         21 if f.requests => f64::from(f.callbacks),
         22 if f.requests => f64::from(f.activations),
+        23 if f.requests => f.asked_main,
+        24 if f.requests => f.asked_process,
         _ => return false,
     };
     unsafe { *out = v };
@@ -854,6 +879,8 @@ unsafe extern "C" fn factory_create(_f: *const clap_plugin_factory, host: *const
         activations: 0,
         last_request: 0.0,
         flush_edit: false,
+        asked_main: 0.0,
+        asked_process: 0.0,
     });
     let raw = Box::into_raw(b);
     unsafe {

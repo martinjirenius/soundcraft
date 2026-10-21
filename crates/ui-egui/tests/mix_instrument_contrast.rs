@@ -186,9 +186,7 @@ fn populated_mix_instrument_uses_readable_palette_in_real_frames() {
     let app = harness.state();
     let replacement = app.engine.session().track(instrument).unwrap().instrument.as_ref().unwrap();
     assert_eq!(replacement.plugin, "drum_synth");
-    for param in soundcraft_dsp::plugin_info("drum_synth").unwrap().params {
-        assert_eq!(replacement.params.get(param.id), Some(&param.default));
-    }
+    assert!(replacement.params.is_empty(), "nothing was set, so every parameter stays the plugin's own: {:?}", replacement.params);
     assert_eq!(app.engine.session().edit.selected_tracks, session.edit.selected_tracks);
     assert_eq!(app.engine.session().pool, session.pool);
     assert!(app.ui.plugin_windows.is_empty(), "a built-in instrument opens its picker");

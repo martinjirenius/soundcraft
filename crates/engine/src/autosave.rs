@@ -179,8 +179,24 @@ impl Autosave {
     /// A new folder under `root` for the session called `name`.
     fn create(root: &Path, name: &str) -> Result<Autosave> {
         let stamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis();
-        let dir = root.join(format!("{} {stamp}-{}", sanitize_name(name), std::process::id()));
-        let lock = std::fs::create_dir_all(&dir).and_then(|()| std::fs::File::create(dir.join(LOCK))).map_err(|err| io_error(&dir, err))?;
+        let base = format!("{} {stamp}-{}", sanitize_name(name), std::process::id());
+        std::fs::create_dir_all(root).map_err(|err| io_error(root, err))?;
+        // A new folder is always new: `create_dir` fails on an existing one, so two sessions
+        // created in the same millisecond get distinct folders rather than sharing one.
+        let mut made = None;
+        for n in 0..1000 {
+            let path = root.join(if n == 0 { base.clone() } else { format!("{base}-{n}") });
+            match std::fs::create_dir(&path) {
+                Ok(()) => {
+                    made = Some(path);
+                    break;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(io_error(&path, err)),
+            }
+        }
+        let Some(dir) = made else { return Err(EngineError::Io(format!("{}: no free autosave folder for {base}", root.display()))) };
+        let lock = std::fs::File::create(dir.join(LOCK)).map_err(|err| io_error(&dir, err))?;
         lock.try_lock().map_err(|err| EngineError::Io(format!("{}: {err}", dir.display())))?;
         Ok(Autosave { dir, lock: Some(lock), copies: BTreeMap::new(), next: 1, recording: false })
     }
@@ -256,8 +272,10 @@ pub struct Leftover {
     pub recording: bool,
 }
 
-/// Leftover autosaves under `root`, newest first: folders no open session holds, written after the
-/// session file they came from or holding a recording. Empty and outdated ones are deleted.
+/// Leftover autosaves under `root`, newest first: folders no open session holds, written not older
+/// than the session file they came from or holding a recording. Empty and outdated ones are deleted.
+/// A tie in the filesystem clock keeps the folder: when it's ambiguous, offer the work rather than
+/// delete it.
 pub fn leftovers(root: &Path) -> Vec<Leftover> {
     let mut out = Vec::new();
     for dir in std::fs::read_dir(root).into_iter().flatten().flatten().map(|d| d.path()) {
@@ -271,7 +289,7 @@ pub fn leftovers(root: &Path) -> Vec<Leftover> {
         let recording = dir.join(RECORDING).is_file();
         drop(lock);
         match saved {
-            Ok(saved) if recording || origin_saved.is_none_or(|o| saved > o) => {
+            Ok(saved) if recording || origin_saved.is_none_or(|o| saved >= o) => {
                 let text = std::fs::read_to_string(dir.join(SESSION)).unwrap_or_default();
                 let named = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v.get("name")?.as_str().map(str::to_string));
                 let name = named.unwrap_or_else(|| dir.file_name().unwrap_or_default().to_string_lossy().into_owned());

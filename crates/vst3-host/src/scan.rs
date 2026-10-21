@@ -104,15 +104,28 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>, budget: &mut usize) {
     if depth > MAX_DEPTH || out.len() >= MAX_BUNDLES {
         return;
     }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            log::warn!("vst3 scan: skipping {}: {e}", dir.display());
+            return;
+        }
+    };
     for entry in rd.flatten() {
         if *budget == 0 || out.len() >= MAX_BUNDLES {
             return;
         }
         *budget -= 1;
         let p = entry.path();
-        // `metadata` follows symlinks (plugins are often symlinked in); errors are skipped.
-        let Ok(md) = std::fs::metadata(&p) else { continue };
+        // `metadata` follows symlinks (plugins are often symlinked in); an entry that cannot be
+        // read is skipped, with the reason logged.
+        let md = match std::fs::metadata(&p) {
+            Ok(md) => md,
+            Err(e) => {
+                log::warn!("vst3 scan: skipping {}: {e}", p.display());
+                continue;
+            }
+        };
         if is_vst3_path(&p) {
             out.push(p);
         } else if md.is_dir() {

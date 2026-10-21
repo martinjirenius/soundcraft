@@ -113,6 +113,29 @@ fn gain_processes_audio_and_follows_params() {
     p.process(&mut io, 8);
 }
 
+/// Protects the fail-loudly rule: a plugin whose `process` fails reports `failed()` (the mixer then
+/// takes it out of the path), and only a successful `prepare` clears it.
+#[test]
+fn a_failing_process_reports_failed_until_the_next_prepare() {
+    use soundcraft_dsp::Plugin as _;
+    let mut p = soundcraft_vst3_host::instantiate_plugin(&id_of("Fixture Gain")).unwrap();
+    p.prepare(44_100.0, 256, 2);
+    assert!(!p.failed());
+    // Gain 0 makes the fixture's process return kResultFalse.
+    assert!(p.set_param("7", 0.0));
+    let mut io = vec![vec![0.5f32; 64], vec![0.5f32; 64]];
+    p.process(&mut io, 64);
+    assert!(p.failed());
+    // A successful prepare re-sends the (now non-zero) gain and clears the flag; audio flows again.
+    assert!(p.set_param("7", 1.0));
+    p.prepare(44_100.0, 256, 2);
+    assert!(!p.failed());
+    let mut io = vec![vec![0.5f32; 64], vec![-0.25f32; 64]];
+    p.process(&mut io, 64);
+    assert!(!p.failed());
+    assert!(io[0].iter().all(|&x| (x - 0.5).abs() < 1e-6), "{:?}", &io[0][..4]);
+}
+
 #[test]
 fn synth_plays_notes_at_their_offsets() {
     let id = id_of("Fixture Synth");

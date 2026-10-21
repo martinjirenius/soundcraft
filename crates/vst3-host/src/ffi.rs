@@ -1083,6 +1083,32 @@ pub(crate) struct Layout {
     pub inputs: Vec<u32>,
     pub outputs: Vec<u32>,
     pub event_input: bool,
+    /// The plugin refused the mono/stereo arrangement asked for (the layout above is its own).
+    pub arrangement_refused: bool,
+}
+
+/// Why a `process` call failed. Plain data, so the audio thread records it without allocating;
+/// the text is only built off the audio thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fault {
+    /// A host-side check failed (not active, block larger than configured, no processor).
+    Host(&'static str),
+    /// The plugin returned a failure code from the named call.
+    Plugin(&'static str, sb::tresult),
+}
+
+impl std::fmt::Display for Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Fault::Host(what) => write!(f, "{what}"),
+            Fault::Plugin(call, code) => write!(f, "{call} returned {code}"),
+        }
+    }
+}
+
+/// `kResultOk` or `kResultTrue`: the success codes VST3 uses.
+fn accepted(r: sb::tresult) -> bool {
+    r == sb::kResultOk || r == sb::kResultTrue
 }
 
 fn apply_transport(c: &mut sv::ProcessContext, t: &Transport) {
@@ -1335,7 +1361,9 @@ impl Instance {
         };
         let want = if mono { sv::SpeakerArr::kMono } else { sv::SpeakerArr::kStereo };
         let p = self.processor().ok_or_else(|| Vst3Error::Process("no audio processor".into()))?.clone();
-        let mut tried_ok = false;
+        // The layout is kept as negotiated here (`ok`: kResultOk only). kResultTrue is what
+        // many plugins answer to an accepted arrangement, so it is not reported as a refusal.
+        let mut arrangement_refused = false;
         for main in [want, sv::SpeakerArr::kStereo] {
             let mut ins = current(self, din, nin);
             let mut outs = current(self, dout, nout);
@@ -1347,21 +1375,22 @@ impl Instance {
             }
             // SAFETY: valid processor; the arrays hold exactly `nin`/`nout` arrangements and
             // outlive the call.
-            if ok(unsafe { p.setBusArrangements(ins.as_mut_ptr(), nin, outs.as_mut_ptr(), nout) }) {
-                tried_ok = true;
+            let r = unsafe { p.setBusArrangements(ins.as_mut_ptr(), nin, outs.as_mut_ptr(), nout) };
+            if ok(r) {
                 break;
+            }
+            if main == want && r != sb::kResultTrue {
+                arrangement_refused = true;
             }
             if main == sv::SpeakerArr::kStereo {
                 break;
             }
         }
-        if !tried_ok {
-            log::debug!("vst3: plugin refused mono/stereo bus arrangements; using its own");
-        }
         let layout = Layout {
             inputs: (0..nin).map(|i| self.bus_channels(din, i)).collect(),
             outputs: (0..nout).map(|i| self.bus_channels(dout, i)).collect(),
             event_input: self.bus_count(event, din) > 0,
+            arrangement_refused,
         };
         // Main buses on, aux buses off (VST3 still gets buffers for every bus).
         for (dir, n) in [(din, nin), (dout, nout)] {
@@ -1440,18 +1469,21 @@ impl Instance {
         offset: u32,
         project_time: i64,
         transport: Option<&Transport>,
-    ) -> Result<(), Vst3Error> {
+    ) -> Result<(), Fault> {
         if !self.active {
-            return Err(Vst3Error::Process("not active".into()));
+            return Err(Fault::Host("not active"));
         }
         if frames == 0 || frames > self.max_frames || frames > inputs.frames || frames > outputs.frames {
-            return Err(Vst3Error::Process("block larger than the configured size".into()));
+            return Err(Fault::Host("block larger than the configured size"));
         }
-        let p = self.processor.clone().ok_or_else(|| Vst3Error::Process("no audio processor".into()))?;
+        let p = self.processor.clone().ok_or(Fault::Host("no audio processor"))?;
         if !self.processing {
-            // Many plugins return kNotImplemented here; that is not an error.
             // SAFETY: valid, active processor.
-            unsafe { p.setProcessing(1) };
+            let r = unsafe { p.setProcessing(1) };
+            // Many plugins return kNotImplemented here because they need no processing call.
+            if r != sb::kNotImplemented && !accepted(r) {
+                return Err(Fault::Plugin("setProcessing", r));
+            }
             self.processing = true;
         }
         self.in_params.clear();
@@ -1500,7 +1532,7 @@ impl Instance {
         // parameter/event objects and the context are owned by `self` and untouched until the
         // call returns.
         let r = unsafe { p.process(&mut data) };
-        if ok(r) { Ok(()) } else { Err(Vst3Error::Process(format!("process returned {r}"))) }
+        if accepted(r) { Ok(()) } else { Err(Fault::Plugin("process", r)) }
     }
 }
 

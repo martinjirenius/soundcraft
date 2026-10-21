@@ -1,7 +1,7 @@
 //! `Vst3Plugin`: a loaded VST3 instance behind the safe `soundcraft_dsp::Plugin` trait.
 
 use crate::ffi::{
-    AFTERTOUCH, BusBuffers, EVENT_CAP, EditorLink, HostContext, Instance, NoteEvent, PARAM_PROGRAM_CHANGE, PARAM_QUEUE_CAP, PITCH_BEND,
+    AFTERTOUCH, BusBuffers, EVENT_CAP, EditorLink, Fault, HostContext, Instance, NoteEvent, PARAM_PROGRAM_CHANGE, PARAM_QUEUE_CAP, PITCH_BEND,
 };
 use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, Transport, Unit};
 use std::collections::HashMap;
@@ -66,6 +66,12 @@ pub struct Vst3Plugin {
     tail: usize,
     position: i64,
     transport: Option<Transport>,
+    /// Set when activation failed in `prepare` or a block failed in `process`; cleared by the
+    /// next successful `prepare`. The plugin's last block is then not its sound.
+    failed: bool,
+    /// The first `process` failure since the last report, recorded on the audio thread and logged
+    /// by the next `prepare` (main thread; `reset` runs on the audio thread and never logs).
+    fault: Option<Fault>,
 }
 
 impl Vst3Plugin {
@@ -116,6 +122,8 @@ impl Vst3Plugin {
             tail: 0,
             position: 0,
             transport: None,
+            failed: false,
+            fault: None,
             ids,
             maps,
             inst,
@@ -180,6 +188,13 @@ impl Vst3Plugin {
         }
     }
 
+    /// Logs the first recorded `process` failure, if any (main thread: `prepare` only).
+    fn report_fault(&mut self) {
+        if let Some(f) = self.fault.take() {
+            log::warn!("{}: VST3 processing failed: {f}", self.info.id);
+        }
+    }
+
     /// Inserts keeping the queue time-sorted; drops the event when the queue is full (never
     /// allocates on the audio thread).
     fn push_note(&mut self, e: NoteEvent) {
@@ -197,6 +212,7 @@ impl Plugin for Vst3Plugin {
     }
 
     fn prepare(&mut self, sample_rate: f32, max_block: usize, channels: usize) {
+        self.report_fault();
         let sr = if sample_rate.is_finite() && sample_rate > 0.0 { f64::from(sample_rate) } else { 48_000.0 };
         let mb = max_block.clamp(1, MAX_BLOCK);
         self.channels = channels.clamp(1, MAX_CHANNELS);
@@ -212,10 +228,16 @@ impl Plugin for Vst3Plugin {
                 self.latency = self.inst.latency() as usize;
                 self.tail = self.inst.tail() as usize;
                 self.midi_map = self.inst.midi_mapping();
+                self.failed = false;
+                if layout.arrangement_refused {
+                    let asked = if self.channels == 1 { "mono" } else { "stereo" };
+                    log::warn!("{}: plugin refused the {asked} bus arrangement; using the layout it chose", self.info.id);
+                }
             }
             Err(e) => {
                 log::warn!("{}: {e}", self.info.id);
                 self.latency = 0;
+                self.failed = true;
             }
         }
         // Re-send the values the host set so a re-activated plugin matches the session. A value only
@@ -232,6 +254,7 @@ impl Plugin for Vst3Plugin {
     }
 
     fn reset(&mut self) {
+        // Runs on the audio thread: a stored fault waits for the next `prepare` to be logged.
         self.notes.clear();
         self.controls.clear();
         self.held = [false; 128];
@@ -316,6 +339,10 @@ impl Plugin for Vst3Plugin {
             self.notes.drain(..k);
             self.position = self.position.saturating_add(i64::try_from(n).unwrap_or(0));
             match r {
+                Err(f) => {
+                    self.failed = true;
+                    self.fault.get_or_insert(f);
+                }
                 Ok(()) if self.has_output => {
                     let oc = self.outputs.channels(0);
                     for (c, dst) in io.iter_mut().take(ch).enumerate() {
@@ -331,12 +358,15 @@ impl Plugin for Vst3Plugin {
                         }
                     }
                 }
-                Err(e) => log::debug!("{}: {e}", self.info.id),
                 _ => {}
             }
             start += n;
         }
         self.controls.clear();
+    }
+
+    fn failed(&self) -> bool {
+        self.failed
     }
 
     fn latency(&self) -> usize {

@@ -4,6 +4,7 @@
 //!   (connected through IConnectionPoint, synced through the component state). Params: 7 "Gain"
 //!   (plain 0..2, linear, units dB), 3 "Mode" (3 steps: A/B/C), 12 "Freq" (20..20000 Hz, log),
 //!   9 hidden, 11 bypass. Starts at gain 0.5 (its state) although the declared default is 1.0.
+//!   A gain of exactly 0 makes its process return kResultFalse (the failure the host must report).
 //!   Reports 3 samples of latency. State: the component stores the gain (one LE f64), the
 //!   controller the Freq value (one LE f64). Its controller has an editor view (`IPlugView`,
 //!   320×240, no real drawing) supporting NSView/HWND/X11.
@@ -202,6 +203,10 @@ impl IAudioProcessorTrait for GainProcessor {
                     self.gain.store(v.to_bits(), Ordering::Relaxed);
                 }
             }
+        }
+        // A gain of exactly 0 makes process fail (kResultFalse): the host must report it as failed.
+        if f64::from_bits(self.gain.load(Ordering::Relaxed)) == 0.0 {
+            return kResultFalse;
         }
         if d.numInputs != 1 || d.numOutputs != 1 {
             return kResultOk;

@@ -82,6 +82,18 @@ fn gain_processes_audio_and_follows_params() {
 }
 
 #[test]
+// Regression: Odin2 (JUCE) segfaulted on param events sent without the cookie from clap_param_info.
+fn param_changes_carry_the_plugins_cookie() {
+    fixture_dir();
+    let mut p = soundcraft_clap_host::create(GAIN).unwrap();
+    p.prepare(44_100.0, 256, 2);
+    assert!(p.set_param("7", 2.0));
+    let mut io = vec![vec![0.5f32; 256], vec![0.5f32; 256]];
+    p.process(&mut io, 256);
+    assert!(io[0].iter().all(|&x| (x - 1.0).abs() < 1e-6), "gain change must reach the plugin");
+}
+
+#[test]
 fn synth_plays_notes_at_their_offsets() {
     fixture_dir();
     let info = soundcraft_clap_host::plugin_info(SYNTH).unwrap();

@@ -161,6 +161,20 @@ unsafe extern "C" fn reset(p: *const clap_plugin) {
     unsafe { fx(p) }.level = 0.0;
 }
 
+// Per-parameter cookies, handed out in `clap_param_info` and expected back in param events.
+static GAIN_COOKIE: u8 = 0;
+static MODE_COOKIE: u8 = 0;
+static SECRET_COOKIE: u8 = 0;
+
+fn cookie_of(id: clap_id) -> *mut c_void {
+    match id {
+        7 => std::ptr::addr_of!(GAIN_COOKIE) as *mut c_void,
+        3 => std::ptr::addr_of!(MODE_COOKIE) as *mut c_void,
+        9 => std::ptr::addr_of!(SECRET_COOKIE) as *mut c_void,
+        _ => std::ptr::null_mut(),
+    }
+}
+
 fn apply(f: &mut Fx, h: &clap_event_header) {
     if h.space_id != CLAP_CORE_EVENT_SPACE_ID {
         return;
@@ -168,6 +182,10 @@ fn apply(f: &mut Fx, h: &clap_event_header) {
     match h.type_ {
         CLAP_EVENT_PARAM_VALUE => {
             let e = unsafe { &*(h as *const clap_event_header as *const clap_event_param_value) };
+            // Like JUCE plugins, trust the host to echo the cookie: a wrong one would be dereferenced, here it is ignored.
+            if e.cookie != cookie_of(e.param_id) {
+                return;
+            }
             match e.param_id {
                 7 => f.gain = e.value,
                 3 => f.mode = e.value,
@@ -316,7 +334,7 @@ unsafe extern "C" fn params_get_info(_p: *const clap_plugin, index: u32, info: *
     };
     info.id = id;
     info.flags = flags;
-    info.cookie = std::ptr::null_mut();
+    info.cookie = cookie_of(id);
     write_name(&mut info.name, name);
     write_name(&mut info.module, c"");
     info.min_value = min;

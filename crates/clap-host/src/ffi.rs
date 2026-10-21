@@ -253,6 +253,7 @@ impl Bundle {
             gui: Arc::new(GuiLink::default()),
             raw: Vec::with_capacity(EVENT_CAP),
             out_params: Vec::with_capacity(EVENT_CAP),
+            cookies: Vec::new(),
             active: false,
             processing: false,
             max_frames: 0,
@@ -273,6 +274,7 @@ impl Bundle {
             return Err(err("plugin init failed"));
         }
         inst.params = inst.extension::<clap_plugin_params>(CLAP_EXT_PARAMS);
+        inst.read_cookies();
         inst.ports = inst.extension::<clap_plugin_audio_ports>(CLAP_EXT_AUDIO_PORTS);
         inst.latency = inst.extension::<clap_plugin_latency>(CLAP_EXT_LATENCY);
         inst.notes = inst.extension::<clap_plugin_note_ports>(CLAP_EXT_NOTE_PORTS);
@@ -552,7 +554,7 @@ impl RawEvent {
         }
     }
 
-    fn from_event(e: &Event, offset: u32) -> RawEvent {
+    fn from_event(e: &Event, offset: u32, cookies: &[(u32, *mut c_void)]) -> RawEvent {
         let header = |size: usize, type_: u16, time: u32| clap_event_header {
             size: u32::try_from(size).unwrap_or(u32::MAX),
             time: time.saturating_sub(offset),
@@ -564,7 +566,7 @@ impl RawEvent {
             Event::Param { time, id, value } => RawEvent::Param(clap_event_param_value {
                 header: header(size_of::<clap_event_param_value>(), CLAP_EVENT_PARAM_VALUE, time),
                 param_id: id,
-                cookie: std::ptr::null_mut(),
+                cookie: cookies.binary_search_by_key(&id, |c| c.0).ok().and_then(|i| cookies.get(i)).map_or(std::ptr::null_mut(), |c| c.1),
                 note_id: -1,
                 port_index: -1,
                 channel: -1,
@@ -1132,6 +1134,8 @@ pub(crate) struct Instance {
     raw: Vec<RawEvent>,
     /// Parameter values the plugin reported through output events in the current `process`.
     out_params: Vec<(u32, f64)>,
+    /// Each parameter's cookie from `clap_param_info`, sorted by id; echoed back in param events (JUCE plugins dereference it).
+    cookies: Vec<(u32, *mut c_void)>,
     active: bool,
     processing: bool,
     max_frames: usize,
@@ -1197,7 +1201,16 @@ impl Instance {
         }
     }
 
-    pub fn params(&self) -> Vec<RawParam> {
+    /// Re-reads every parameter's cookie. Cookies only change through a params rescan, so this runs
+    /// at instantiate and on each activate (which is always made while deactivated).
+    fn read_cookies(&mut self) {
+        let mut cookies: Vec<(u32, *mut c_void)> = self.param_infos().iter().map(|info| (info.id, info.cookie)).collect();
+        cookies.sort_unstable_by_key(|c| c.0);
+        self.cookies = cookies;
+    }
+
+    /// The raw `clap_param_info` of every parameter the plugin describes (empty without `clap.params`).
+    fn param_infos(&self) -> Vec<clap_param_info> {
         // SAFETY: the extension pointer, when non-null, points to a static vtable in the plugin.
         let Some(p) = (unsafe { self.params.as_ref() }) else { return Vec::new() };
         let (Some(count), Some(get_info)) = (p.count, p.get_info) else { return Vec::new() };
@@ -1212,6 +1225,14 @@ impl Instance {
             if !unsafe { get_info(self.plugin, i, &mut info) } {
                 continue;
             }
+            out.push(info);
+        }
+        out
+    }
+
+    pub fn params(&self) -> Vec<RawParam> {
+        let mut out = Vec::new();
+        for info in self.param_infos() {
             let (min, max) = (info.min_value, info.max_value);
             if !(min.is_finite() && max.is_finite()) || max < min {
                 continue;
@@ -1304,6 +1325,7 @@ impl Instance {
 
     pub fn activate(&mut self, sample_rate: f64, min_frames: u32, max_frames: u32) -> Result<(), ClapError> {
         self.deactivate();
+        self.read_cookies();
         let f = self.vt().activate.ok_or_else(|| ClapError::Process("plugin has no activate".into()))?;
         // SAFETY: valid, inactive instance; arguments are sane (checked by the caller).
         if !unsafe { f(self.plugin, sample_rate, min_frames, max_frames) } {
@@ -1376,7 +1398,7 @@ impl Instance {
         let process = self.vt().process.ok_or_else(|| ClapError::Process("plugin has no process".into()))?;
         self.raw.clear();
         for e in events.iter().take(self.raw.capacity()) {
-            self.raw.push(RawEvent::from_event(e, offset));
+            self.raw.push(RawEvent::from_event(e, offset, &self.cookies));
         }
         inputs.refresh();
         outputs.refresh();

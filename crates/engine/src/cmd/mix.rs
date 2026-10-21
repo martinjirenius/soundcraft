@@ -328,16 +328,15 @@ fn insert(e: &mut Engine, p: &Value) -> Result<Value> {
     let tr = s.track_mut(t).ok_or_else(|| bad("mix.insert", "no track"))?;
     let slot =
         explicit.or_else(|| tr.mixer.inserts.iter().position(Option::is_none)).ok_or_else(|| bad("mix.insert", "all insert slots are in use"))?;
+    // Only values something set are stored; the rest belongs to the plugin.
     let mut ins = Insert::new(info.id);
-    for pi in info.params {
-        ins.params.insert(pi.id.to_string(), pi.default);
-    }
     if let Some(obj) = p.get("params").and_then(Value::as_object) {
         for (k, v) in obj {
             let Some(pi) = info.params.iter().find(|x| x.id == k) else {
                 return Err(bad("mix.insert", format!("`{plugin}` has no parameter `{k}`")));
             };
-            let val = v.as_f64().map_or(pi.default, |f| (f as f32).clamp(pi.min, pi.max));
+            let f = v.as_f64().filter(|f| f.is_finite()).ok_or_else(|| bad("mix.insert", format!("`{k}` must be a number")))?;
+            let val = (f as f32).clamp(pi.min, pi.max);
             ins.params.insert(k.clone(), val);
         }
     }
@@ -522,6 +521,13 @@ fn write_range(e: &mut Engine, p: &Value) -> Result<Value> {
     Ok(json!({}))
 }
 
+/// The advertised default of an insert's parameter: the best the engine knows when the plugin
+/// owns the value (nothing stored), and exact for a built-in.
+fn plugin_default(tr: &soundcraft_model::Track, slot: u8, param: &str) -> Option<f32> {
+    let ins = tr.mixer.inserts.get(usize::from(slot)).and_then(Option::as_ref)?;
+    super::clap::plugin_info(&ins.plugin)?.params.iter().find(|x| x.id == param).map(|pi| pi.default)
+}
+
 /// The static (non-automated) value of a parameter on a track.
 pub(crate) fn current_value(tr: &soundcraft_model::Track, param: &AutoParam) -> f32 {
     match param {
@@ -531,9 +537,14 @@ pub(crate) fn current_value(tr: &soundcraft_model::Track, param: &AutoParam) -> 
         AutoParam::SendLevel(i) => tr.mixer.sends.get(usize::from(*i)).and_then(Option::as_ref).map_or(-144.0, |s| s.level_db),
         AutoParam::SendPan(i) => tr.mixer.sends.get(usize::from(*i)).and_then(Option::as_ref).map_or(0.0, |s| s.pan),
         AutoParam::SendMute(i) => tr.mixer.sends.get(usize::from(*i)).and_then(Option::as_ref).map_or(0.0, |s| f32::from(u8::from(s.mute))),
-        AutoParam::Plugin { slot, param } => {
-            tr.mixer.inserts.get(usize::from(*slot)).and_then(Option::as_ref).and_then(|i| i.params.get(param).copied()).unwrap_or(0.0)
-        }
+        AutoParam::Plugin { slot, param } => tr
+            .mixer
+            .inserts
+            .get(usize::from(*slot))
+            .and_then(Option::as_ref)
+            .and_then(|i| i.params.get(param).copied())
+            .or_else(|| plugin_default(tr, *slot, param))
+            .unwrap_or(0.0),
     }
 }
 
@@ -877,7 +888,8 @@ mod tests {
         let t = e.session().tracks[0].id.0;
         e.execute("mix.insert", &json!({"track": t, "slot": 0, "plugin": "gain"})).unwrap();
         fn gain(e: &Engine) -> f32 {
-            e.session().tracks[0].mixer.inserts[0].as_ref().unwrap().params["gain"]
+            // An unset parameter belongs to the plugin; this stands in for it.
+            e.session().tracks[0].mixer.inserts[0].as_ref().unwrap().params.get("gain").copied().unwrap_or(0.0)
         }
 
         // A typo names no parameter: the call fails and says which key.

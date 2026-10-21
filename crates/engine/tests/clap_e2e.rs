@@ -127,3 +127,45 @@ fn clap_state_is_captured_stored_and_restored_before_the_first_block() {
     let half = gain_of(e.session());
     assert!((half - reference / 3.0).abs() < 1e-5, "{half} vs {}", reference / 3.0);
 }
+
+/// Regression: Surge XT played digital silence because placing a plugin stored every parameter's
+/// advertised default (0 for Surge) and the mixer pushed them all in. The fixture synth does the
+/// same trap: its Volume really starts at 1.0 but advertises 0.0. Contract: with no `params`,
+/// nothing is stored and the host never writes a parameter, so the plugin keeps its own value.
+#[test]
+fn an_instrument_placed_without_params_keeps_the_plugins_own_values() {
+    install_fixture();
+    let mut e = Engine::default();
+    let r = e.execute("track.new", &json!({"kind": "instrument", "name": "Keys"})).unwrap();
+    let track = r["tracks"][0].as_u64().unwrap();
+    e.execute("mix.instrument", &json!({"track": track, "plugin": "clap:org.soundcraft.test.synth"})).unwrap();
+    let r = e.execute("midi.new_clip", &json!({"track": track, "start": 0, "length": 96_000})).unwrap();
+    let clip = r["clip"].as_u64().unwrap();
+    e.execute("midi.note_add", &json!({"clip": clip, "pitch": 60, "start_ticks": 0, "length_ticks": 960, "velocity": 127})).unwrap();
+
+    let out = soundcraft_mix::render_range(e.session(), Range::new(0, 4800), 512);
+    let peak = out.iter().flatten().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(peak > 0.5, "the synth plays at its own volume, not the advertised default 0: peak {peak}");
+    let ins = e.session().tracks.iter().find(|t| t.id.0 == track).and_then(|t| t.instrument.as_ref()).unwrap();
+    assert!(ins.params.is_empty(), "nothing was set, so nothing is stored: {:?}", ins.params);
+}
+
+/// Contract: automation on a parameter that is not stored (the plugin owns it) still reaches the plugin.
+#[test]
+fn automation_on_an_unset_plugin_param_reaches_the_plugin() {
+    install_fixture();
+    let mut e = Engine::default();
+    let s = e.session_mut();
+    let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+    s.pool.insert(SourceId(79), Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.25; 4800]] })));
+    let id = s.new_clip_id();
+    s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "dc", SourceId(79), 0, 0, 4800));
+    e.execute("mix.insert", &json!({"track": t.0, "plugin": "clap:org.soundcraft.test.gain"})).unwrap();
+    let plain = soundcraft_mix::render_range(e.session(), Range::new(0, 4800), 512)[0][2000];
+    assert!(plain.abs() > 0.1, "the plugin keeps its own gain 1.0: {plain}");
+    for at in [0, 4800] {
+        e.execute("automation.set_point", &json!({"track": t.0, "param": "plugin:a:7", "at": at, "value": 0.5})).unwrap();
+    }
+    let automated = soundcraft_mix::render_range(e.session(), Range::new(0, 4800), 512)[0][2000];
+    assert!((automated - 0.5 * plain).abs() < 1e-4, "automation drives the unset gain: {automated}");
+}

@@ -212,6 +212,8 @@ struct PluginSlot {
     plugin: Box<dyn Plugin>,
     /// Last values pushed to the plugin, in the insert's parameter-map order.
     applied: Vec<f32>,
+    /// Last values pushed for automation lanes on parameters that are not stored, by lane index.
+    applied_lanes: Vec<f32>,
     failed: bool,
 }
 
@@ -411,7 +413,7 @@ impl SlotCtx<'_> {
             let state = if third { ins.state_bytes() } else { None };
             create_instance(&ins.plugin, state.as_deref(), self.sr, self.mb, ch).map(|n| n.plugin)
         }?;
-        Some(PluginSlot { id: ins.plugin.clone(), ch, plugin, applied: Vec::new(), failed: false })
+        Some(PluginSlot { id: ins.plugin.clone(), ch, plugin, applied: Vec::new(), applied_lanes: Vec::new(), failed: false })
     }
 }
 
@@ -1662,23 +1664,32 @@ fn apply_params(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, t: &Track
     // Automation lanes address insert slots; the instrument (`INSTRUMENT_SLOT`) has none, so it
     // must not pick up slot A's lanes.
     let Ok(slot_u8) = u8::try_from(i) else {
-        return apply_values(slot, ins, |_, v| v);
+        return apply_values(slot, ins, |_, v| v, None);
     };
-    let automated = t.mixer.automation_mode.reads()
-        && t.automation.iter().any(|l| matches!(&l.param, AutoParam::Plugin { slot, .. } if *slot == slot_u8) && !l.points.is_empty());
-    apply_values(slot, ins, |k, val| {
-        if automated
-            && let Some(l) = t.automation.iter().find(|l| matches!(&l.param, AutoParam::Plugin { slot, param } if *slot == slot_u8 && param == k))
-            && !l.points.is_empty()
-        {
-            return l.value_at(pos, val);
-        }
-        val
-    });
+    let reads = t.mixer.automation_mode.reads();
+    let lane_of = |k: &str| {
+        t.automation.iter().find(|l| matches!(&l.param, AutoParam::Plugin { slot, param } if *slot == slot_u8 && param == k) && !l.points.is_empty())
+    };
+    apply_values(
+        slot,
+        ins,
+        |k, val| match lane_of(k).filter(|_| reads) {
+            Some(l) => l.value_at(pos, val),
+            None => val,
+        },
+        reads.then_some((t.automation.as_slice(), slot_u8, pos)),
+    );
 }
 
 /// Sends each stored param (as mapped by `value`) to the plugin when it changed since last time.
-fn apply_values(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, value: impl Fn(&str, f32) -> f32) {
+/// A parameter that is not stored belongs to the plugin and is never written, except that an
+/// automation lane on it (`lanes`: the track's lanes, the insert slot and the position) drives it.
+fn apply_values(
+    slot: &mut PluginSlot,
+    ins: &soundcraft_model::Insert,
+    value: impl Fn(&str, f32) -> f32,
+    lanes: Option<(&[soundcraft_model::AutomationLane], u8, Samples)>,
+) {
     if slot.applied.len() != ins.params.len() {
         slot.applied = vec![f32::NAN; ins.params.len()];
     }
@@ -1686,6 +1697,21 @@ fn apply_values(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, value: im
         let val = value(k, *v);
         if val.to_bits() != last.to_bits() {
             slot.plugin.set_param(k, val);
+            *last = val;
+        }
+    }
+    let Some((lanes, slot_u8, pos)) = lanes else { return };
+    if slot.applied_lanes.len() != lanes.len() {
+        slot.applied_lanes = vec![f32::NAN; lanes.len()];
+    }
+    for (l, last) in lanes.iter().zip(slot.applied_lanes.iter_mut()) {
+        let AutoParam::Plugin { slot: ls, param } = &l.param else { continue };
+        if *ls != slot_u8 || l.points.is_empty() || ins.params.contains_key(param) {
+            continue;
+        }
+        let val = l.value_at(pos, 0.0);
+        if val.to_bits() != last.to_bits() {
+            slot.plugin.set_param(param, val);
             *last = val;
         }
     }

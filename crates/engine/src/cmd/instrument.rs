@@ -61,9 +61,7 @@ fn set_instrument(e: &mut Engine, p: &Value) -> Result<Value> {
         }
     }
     let mut ins = Insert::new(info.id);
-    for pi in info.params {
-        ins.params.insert(pi.id.to_string(), pi.default);
-    }
+    // Only values something set are stored; the rest belongs to the plugin.
     for (k, v) in values {
         ins.params.insert(k, v);
     }
@@ -113,7 +111,7 @@ mod tests {
         assert_eq!(r["plugin"], "drum_synth");
         assert_eq!(instrument_of(&e, t).as_deref(), Some("drum_synth"));
         let params = e.session().track(t).and_then(|tr| tr.instrument.as_ref()).map(|i| i.params.len());
-        assert_eq!(params, soundcraft_dsp::plugin_info("drum_synth").map(|p| p.params.len()), "every parameter at its default");
+        assert_eq!(params, Some(0), "nothing stored: no value was set, so every parameter stays the plugin's own");
         e.execute("edit.undo", &json!({})).unwrap();
         assert_eq!(instrument_of(&e, t).as_deref(), Some("subtractive_synth"));
     }
@@ -163,13 +161,13 @@ mod tests {
         open.execute("mix.instrument", &json!({"track": o.0, "plugin": "subtractive_synth", "params": {"cutoff": 12_000}})).unwrap();
         let (quiet, loud) = (rms_of_a_note(&mut closed, t, 2), rms_of_a_note(&mut open, o, 2));
         assert!(loud > quiet * 3.0, "cutoff 12000 plays a high note much louder than 200: {loud} vs {quiet}");
-        // Values are clamped into range; the instrument starts from its defaults for the rest.
+        // Values are clamped into range; the rest stays the plugin's own.
         let mut e = Engine::default();
         let t = track(&mut e, "instrument");
         e.execute("mix.instrument", &json!({"track": t.0, "plugin": "subtractive_synth", "params": {"cutoff": 1.0e9}})).unwrap();
         let ins = e.session().track(t).and_then(|tr| tr.instrument.clone()).unwrap();
         assert_eq!(ins.params.get("cutoff"), Some(&20_000.0));
-        assert_eq!(ins.params.len(), soundcraft_dsp::plugin_info("subtractive_synth").map(|p| p.params.len()).unwrap());
+        assert_eq!(ins.params.keys().collect::<Vec<_>>(), ["cutoff"], "only the value that was given is stored");
 
         // Nothing is accepted and then ignored: a parameter beside `plugin`, an unknown id, a value
         // that is not a number and a `params` that is not an object are errors, and change nothing.

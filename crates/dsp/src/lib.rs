@@ -201,6 +201,12 @@ pub trait Plugin: Send {
     fn param(&self, id: &str) -> Option<f32>;
     /// In-place processing of `channels` planar buffers each `frames` long.
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize);
+    /// True when the plugin could not do its job: it failed to activate or to process, so the
+    /// last block's output is not its sound. The mixer then takes it out of the signal path and
+    /// reports it, as it does for NaN output, until the next reset. Must not allocate or lock.
+    fn failed(&self) -> bool {
+        false
+    }
     /// Processing latency in samples (for delay compensation).
     fn latency(&self) -> usize {
         0

@@ -13,7 +13,7 @@ const SYNTH: &str = "clap:org.soundcraft.test.synth";
 fn scan_lists_both_fixture_plugins() {
     let dir = fixture_dir();
     let found = soundcraft_clap_host::scan_paths(&[dir.to_path_buf()]);
-    assert_eq!(found.len(), 5);
+    assert_eq!(found.len(), 6);
     let g = found.iter().find(|d| d.id == GAIN).unwrap();
     assert_eq!(g.name, "Fixture Gain");
     assert_eq!(g.vendor, "SoundCraft tests");
@@ -129,6 +129,7 @@ fn layouts_beyond_the_host_limits_are_rejected_not_truncated() {
     let mut p = soundcraft_clap_host::create("clap:org.soundcraft.test.wide16").unwrap();
     p.prepare(44_100.0, 64, 2);
     assert_eq!(p.latency(), 3);
+    assert!(!p.failed());
     let mut io = vec![vec![0.5f32; 64]; 2];
     p.process(&mut io, 64);
     assert!(io.iter().flatten().all(|&x| x == 1.0), "16x64 layout delivered as advertised: {:?}", &io[0][..4]);
@@ -137,10 +138,40 @@ fn layouts_beyond_the_host_limits_are_rejected_not_truncated() {
         let mut p = soundcraft_clap_host::create(id).unwrap();
         p.prepare(44_100.0, 64, 2);
         assert_eq!(p.latency(), 0, "{id}: not activated");
+        assert!(p.failed(), "{id}: the host reports the failed activation");
         let mut io = vec![vec![0.5f32; 64]; 2];
         p.process(&mut io, 64);
         assert!(io.iter().flatten().all(|&x| x == 0.5), "{id}: the plugin never ran: {:?}", &io[0][..4]);
     }
+}
+
+#[test]
+fn a_plugin_whose_process_errors_reports_failed_until_prepared_again() {
+    // Protects: a plugin that returns a processing error is reported as failed (the mixer takes
+    // it out), and a successful prepare clears the flag again.
+    fixture_dir();
+    let faulty = "clap:org.soundcraft.test.faulty";
+    let mut p = soundcraft_clap_host::create(faulty).unwrap();
+    p.prepare(48_000.0, 64, 2);
+    assert!(!p.failed(), "a healthy block is not a failure");
+    // A negative first input sample makes the fixture return CLAP_PROCESS_ERROR.
+    p.process(&mut vec![vec![-1.0f32; 64]; 2], 64);
+    assert!(p.failed(), "CLAP_PROCESS_ERROR is reported as a failed plugin");
+    p.prepare(48_000.0, 64, 2);
+    assert!(!p.failed(), "a successful prepare clears the failure");
+}
+
+#[test]
+fn the_output_event_queue_refuses_what_it_cannot_store() {
+    // Protects: CLAP try_push returns false when the host's queue is full, rather than claiming
+    // to have stored the event. The fixture pushes 1025 parameter events per block (the queue
+    // holds 1024): it expects the first 1024 accepted and the last refused, and returns
+    // CLAP_PROCESS_ERROR otherwise, so a host that said "stored" to a full queue fails here.
+    fixture_dir();
+    let mut p = soundcraft_clap_host::create("clap:org.soundcraft.test.faulty").unwrap();
+    p.prepare(48_000.0, 64, 2);
+    p.process(&mut vec![vec![0.5f32; 64]; 2], 64);
+    assert!(!p.failed(), "the queue accepts exactly its capacity and refuses the next event");
 }
 
 #[test]

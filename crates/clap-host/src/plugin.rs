@@ -41,6 +41,10 @@ pub struct ClapPlugin {
     latency: usize,
     steady: i64,
     transport: Option<Transport>,
+    /// Set when activation or processing failed; cleared by a successful `prepare`.
+    failed: bool,
+    /// Input events dropped because `queue` was full (reported by `report_dropped`).
+    dropped_in: usize,
 }
 
 impl ClapPlugin {
@@ -65,6 +69,22 @@ impl ClapPlugin {
             latency: 0,
             steady: 0,
             transport: None,
+            failed: false,
+            dropped_in: 0,
+        }
+    }
+
+    /// Logs the events dropped since the last report, then zeroes the counts. Logs and so
+    /// allocates: only `prepare` calls it (main thread), never the audio path.
+    fn report_dropped(&mut self) {
+        let (out, input) = self.inst.take_dropped();
+        let input = self.dropped_in.saturating_add(input);
+        self.dropped_in = 0;
+        if input > 0 {
+            log::warn!("{}: dropped {input} input event(s), the host event queue was full", self.info.id);
+        }
+        if out > 0 {
+            log::warn!("{}: refused {out} output event(s), the host event queue was full", self.info.id);
         }
     }
 
@@ -83,6 +103,7 @@ impl ClapPlugin {
     /// allocates on the audio thread).
     fn push(&mut self, e: Event) {
         if self.queue.len() >= self.queue.capacity() {
+            self.dropped_in = self.dropped_in.saturating_add(1);
             return;
         }
         let pos = self.queue.iter().rposition(|q| q.time() <= e.time()).map_or(0, |i| i + 1);
@@ -108,6 +129,7 @@ impl Plugin for ClapPlugin {
     }
 
     fn prepare(&mut self, sample_rate: f32, max_block: usize, channels: usize) {
+        self.report_dropped();
         let sr = if sample_rate.is_finite() && sample_rate > 0.0 { f64::from(sample_rate) } else { 48_000.0 };
         let mb = max_block.clamp(1, MAX_BLOCK);
         self.channels = channels.clamp(1, MAX_CHANNELS);
@@ -119,6 +141,7 @@ impl Plugin for ClapPlugin {
             Err(e) => {
                 // Unsupported layout: stay inactive (`process` passes audio through untouched).
                 log::warn!("{}: {e}", self.info.id);
+                self.failed = true;
                 self.inputs = PortBuffers::new(&[], 0);
                 self.outputs = PortBuffers::new(&[], 0);
                 self.in_main = None;
@@ -141,15 +164,19 @@ impl Plugin for ClapPlugin {
             Ok(()) => {
                 self.latency = self.inst.latency() as usize;
                 self.inst.state().latency_changed.store(false, Ordering::Relaxed);
+                self.failed = false;
             }
             Err(e) => {
                 log::warn!("{}: {e}", self.info.id);
+                self.failed = true;
                 self.latency = 0;
             }
         }
     }
 
     fn reset(&mut self) {
+        // Runs on the audio thread: no logging here. The drop counts carry over to the next
+        // `prepare`, which reports them.
         self.inst.reset();
         self.queue.retain(|e| matches!(e, Event::Param { .. }));
         self.held = [false; 128];
@@ -226,7 +253,8 @@ impl Plugin for ClapPlugin {
                         }
                     }
                 }
-                (Err(e), _) => log::debug!("{}: {e}", self.info.id),
+                // No logging here (audio path): the flag is the report.
+                (Err(_), _) => self.failed = true,
                 _ => {}
             }
             start += n;
@@ -235,6 +263,10 @@ impl Plugin for ClapPlugin {
 
     fn latency(&self) -> usize {
         self.latency
+    }
+
+    fn failed(&self) -> bool {
+        self.failed
     }
 
     fn set_transport(&mut self, transport: &Transport) {

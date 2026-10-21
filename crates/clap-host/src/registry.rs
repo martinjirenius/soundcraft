@@ -57,8 +57,16 @@ pub fn scan_paths(dirs: &[PathBuf]) -> Vec<ClapDescriptor> {
         match load_bundle(&path) {
             Ok(ds) => {
                 for d in ds {
-                    if !out.iter().any(|o| o.id == d.id) {
-                        out.push(d);
+                    let first = out.iter().find(|o| o.id == d.id).map(|o| o.path.clone());
+                    match first {
+                        Some(first) => log::warn!(
+                            "plugin scan skipped {} in {}: its id {} is already provided by {}",
+                            d.name,
+                            d.path.display(),
+                            d.id,
+                            first.display()
+                        ),
+                        None => out.push(d),
                     }
                 }
             }

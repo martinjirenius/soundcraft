@@ -254,6 +254,8 @@ impl Bundle {
             raw: Vec::with_capacity(EVENT_CAP),
             out_params: Vec::with_capacity(EVENT_CAP),
             cookies: Vec::new(),
+            dropped_in: 0,
+            dropped_out: 0,
             active: false,
             processing: false,
             max_frames: 0,
@@ -648,28 +650,44 @@ unsafe extern "C" fn in_events_get(list: *const clap_input_events, index: u32) -
     v.and_then(|v| v.get(index as usize)).map_or(std::ptr::null(), RawEvent::header)
 }
 
+/// What `out_events_try_push` writes into during one `process` call.
+struct OutSink<'a> {
+    /// Parameter values the plugin reported, kept while there is room.
+    params: &'a mut Vec<(u32, f64)>,
+    /// Parameter events refused because `params` was full.
+    refused: &'a mut usize,
+}
+
 unsafe extern "C" fn out_events_try_push(list: *const clap_output_events, event: *const clap_event_header) -> bool {
-    // Plugin → host events are accepted. Parameter values (typically edits in the plugin's GUI)
-    // are kept, while there is room, so the UI can write them into the session; the rest is
-    // ignored.
+    // Plugin → host events. Parameter values (typically edits in the plugin's GUI) are kept while
+    // there is room, so the UI can write them into the session. Returns false when a parameter
+    // value could not be stored (malformed, or the queue is full), as CLAP requires. Every other
+    // event type is accepted and discarded: the host has no use for it yet.
     if list.is_null() || event.is_null() {
-        return true;
+        return false;
     }
     // SAFETY: CLAP passes a valid event header for the duration of the call.
     let h = unsafe { &*event };
-    if h.space_id != CLAP_CORE_EVENT_SPACE_ID || h.type_ != CLAP_EVENT_PARAM_VALUE || (h.size as usize) < size_of::<clap_event_param_value>() {
+    if h.space_id != CLAP_CORE_EVENT_SPACE_ID || h.type_ != CLAP_EVENT_PARAM_VALUE {
         return true;
+    }
+    if (h.size as usize) < size_of::<clap_event_param_value>() {
+        return false;
     }
     // SAFETY: the header says this is a complete `clap_event_param_value` (type and size checked).
     let e = unsafe { &*event.cast::<clap_event_param_value>() };
-    // SAFETY: `ctx` is null or the instance's preallocated `out_params` Vec, which `process`
-    // borrows exclusively for the duration of the plugin call.
-    if let Some(v) = unsafe { ((*list).ctx as *mut Vec<(u32, f64)>).as_mut() }
-        && v.len() < v.capacity()
-        && e.value.is_finite()
-    {
-        v.push((e.param_id, e.value));
+    // SAFETY: `ctx` is the `OutSink` that `process` built on its stack for this call; it outlives
+    // the plugin call and nothing else touches it during the call.
+    let Some(sink) = (unsafe { ((*list).ctx as *mut OutSink<'_>).as_mut() }) else { return false };
+    // A non-finite value is discarded on purpose: accepted, not stored.
+    if !e.value.is_finite() {
+        return true;
     }
+    if sink.params.len() >= sink.params.capacity() {
+        *sink.refused = sink.refused.saturating_add(1);
+        return false;
+    }
+    sink.params.push((e.param_id, e.value));
     true
 }
 
@@ -1136,6 +1154,10 @@ pub(crate) struct Instance {
     out_params: Vec<(u32, f64)>,
     /// Each parameter's cookie from `clap_param_info`, sorted by id; echoed back in param events (JUCE plugins dereference it).
     cookies: Vec<(u32, *mut c_void)>,
+    /// Input events not handed to the plugin because the event list was full (see `take_dropped`).
+    dropped_in: usize,
+    /// Output parameter events the host refused because `out_params` was full (see `take_dropped`).
+    dropped_out: usize,
     active: bool,
     processing: bool,
     max_frames: usize,
@@ -1319,6 +1341,11 @@ impl Instance {
         }
     }
 
+    /// Input and output events dropped since the last call, as `(input, output)`; resets both counts.
+    pub fn take_dropped(&mut self) -> (usize, usize) {
+        (std::mem::take(&mut self.dropped_in), std::mem::take(&mut self.dropped_out))
+    }
+
     pub fn is_active(&self) -> bool {
         self.active
     }
@@ -1397,7 +1424,9 @@ impl Instance {
         }
         let process = self.vt().process.ok_or_else(|| ClapError::Process("plugin has no process".into()))?;
         self.raw.clear();
-        for e in events.iter().take(self.raw.capacity()) {
+        let cap = self.raw.capacity();
+        self.dropped_in = self.dropped_in.saturating_add(events.len().saturating_sub(cap));
+        for e in events.iter().take(cap) {
             self.raw.push(RawEvent::from_event(e, offset, &self.cookies));
         }
         inputs.refresh();
@@ -1408,8 +1437,8 @@ impl Instance {
             get: Some(in_events_get),
         };
         self.out_params.clear();
-        let out_events =
-            clap_output_events { ctx: (&mut self.out_params as *mut Vec<(u32, f64)>).cast::<c_void>(), try_push: Some(out_events_try_push) };
+        let mut sink = OutSink { params: &mut self.out_params, refused: &mut self.dropped_out };
+        let out_events = clap_output_events { ctx: (&mut sink as *mut OutSink<'_>).cast::<c_void>(), try_push: Some(out_events_try_push) };
         let transport = transport.map(transport_event);
         let p = clap_process {
             steady_time,

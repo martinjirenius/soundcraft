@@ -76,15 +76,37 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>, budget: &mut usize) {
     if depth > MAX_DEPTH || out.len() >= MAX_BUNDLES {
         return;
     }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for entry in rd.flatten() {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        // A default search folder that is not there is normal; anything else is a skip with a reason.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            log::warn!("plugin scan skipped {}: {e}", dir.display());
+            return;
+        }
+    };
+    for entry in rd {
         if *budget == 0 || out.len() >= MAX_BUNDLES {
             return;
         }
         *budget -= 1;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                log::warn!("plugin scan skipped an entry in {}: {e}", dir.display());
+                continue;
+            }
+        };
         let p = entry.path();
-        // `metadata` follows symlinks (plugins are often symlinked in); errors are skipped.
-        let Ok(md) = std::fs::metadata(&p) else { continue };
+        // `metadata` follows symlinks (plugins are often symlinked in); a dangling or unreadable
+        // one is skipped with its reason.
+        let md = match std::fs::metadata(&p) {
+            Ok(md) => md,
+            Err(e) => {
+                log::warn!("plugin scan skipped {}: {e}", p.display());
+                continue;
+            }
+        };
         if is_clap_path(&p) {
             out.push(p);
         } else if md.is_dir() {

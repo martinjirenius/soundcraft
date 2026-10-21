@@ -12,6 +12,11 @@
 //!   `process` writes 1.0 into every output channel it was given when the host's buffers match the
 //!   advertised layout, -1.0 when they do not.
 //!
+//! - `org.soundcraft.test.faulty`: stereo effect that exercises the host's failure reporting. A
+//!   negative first input sample makes `process` return CLAP_PROCESS_ERROR. Every block it also
+//!   pushes 1025 parameter events, which the host must accept 1024 of and refuse the last one;
+//!   any other answer returns CLAP_PROCESS_ERROR too.
+//!
 //! The gain plugin also implements `clap.state` (gain and mode as two little-endian f64s) and a
 //! floating-only `clap.gui` without a real window: showing it "edits" the gain to 0.25 in the GUI,
 //! reported as an output parameter event by the next `process`.
@@ -62,6 +67,7 @@ const fn wide_desc(id: &'static CStr, name: &'static CStr) -> clap_plugin_descri
 static WIDE16_DESC: clap_plugin_descriptor = wide_desc(c"org.soundcraft.test.wide16", c"Fixture Wide 16x64");
 static WIDE17_DESC: clap_plugin_descriptor = wide_desc(c"org.soundcraft.test.wide17ports", c"Fixture Wide 17 ports");
 static WIDE65_DESC: clap_plugin_descriptor = wide_desc(c"org.soundcraft.test.wide65ch", c"Fixture Wide 65 channels");
+static FAULTY_DESC: clap_plugin_descriptor = wide_desc(c"org.soundcraft.test.faulty", c"Fixture Faulty");
 
 static GAIN_DESC: clap_plugin_descriptor = clap_plugin_descriptor {
     clap_version: CLAP_VERSION,
@@ -93,6 +99,8 @@ struct Fx {
     plugin: clap_plugin,
     host: *const clap_host,
     synth: bool,
+    /// The `org.soundcraft.test.faulty` behaviour (see the module docs).
+    faulty: bool,
     /// `(ports per direction, channels per port)` for the wide fixtures.
     wide: Option<(u32, u32)>,
     gain: f64,
@@ -208,6 +216,39 @@ fn apply(f: &mut Fx, h: &clap_event_header) {
     }
 }
 
+/// `org.soundcraft.test.faulty` (see the module docs). The host's output queue holds 1024 events
+/// (`EVENT_CAP`); the plugin expects the first 1024 accepted and the 1025th refused.
+unsafe fn faulty_process(pr: &clap_process) -> clap_process_status {
+    const HOST_QUEUE: usize = 1024;
+    let Some(push) = (unsafe { &*pr.out_events }).try_push else { return CLAP_PROCESS_ERROR };
+    let mut as_expected = true;
+    for i in 0..=HOST_QUEUE {
+        let e = clap_event_param_value {
+            header: clap_event_header {
+                size: std::mem::size_of::<clap_event_param_value>() as u32,
+                time: 0,
+                space_id: CLAP_CORE_EVENT_SPACE_ID,
+                type_: CLAP_EVENT_PARAM_VALUE,
+                flags: 0,
+            },
+            param_id: 7,
+            cookie: std::ptr::null_mut(),
+            note_id: -1,
+            port_index: -1,
+            channel: -1,
+            key: -1,
+            value: 0.5,
+        };
+        let accepted = unsafe { push(pr.out_events, &e.header) };
+        as_expected &= accepted == (i < HOST_QUEUE);
+    }
+    let fail_requested = pr.audio_inputs_count == 1 && pr.frames_count > 0 && {
+        let inp = unsafe { &*pr.audio_inputs };
+        inp.channel_count > 0 && unsafe { **inp.data32 } < 0.0
+    };
+    if as_expected && !fail_requested { CLAP_PROCESS_CONTINUE } else { CLAP_PROCESS_ERROR }
+}
+
 unsafe extern "C" fn process(p: *const clap_plugin, pr: *const clap_process) -> clap_process_status {
     let f = unsafe { fx(p) };
     let pr = unsafe { &*pr };
@@ -230,6 +271,9 @@ unsafe extern "C" fn process(p: *const clap_plugin, pr: *const clap_process) -> 
             }
         }
         return CLAP_PROCESS_CONTINUE;
+    }
+    if f.faulty {
+        return unsafe { faulty_process(pr) };
     }
     if pr.audio_outputs_count != 1 {
         return CLAP_PROCESS_ERROR;
@@ -581,7 +625,7 @@ unsafe extern "C" fn on_main_thread(_p: *const clap_plugin) {}
 // ---- factory + entry ----
 
 unsafe extern "C" fn factory_count(_f: *const clap_plugin_factory) -> u32 {
-    5
+    6
 }
 
 unsafe extern "C" fn factory_desc(_f: *const clap_plugin_factory, i: u32) -> *const clap_plugin_descriptor {
@@ -591,6 +635,7 @@ unsafe extern "C" fn factory_desc(_f: *const clap_plugin_factory, i: u32) -> *co
         2 => &WIDE16_DESC,
         3 => &WIDE17_DESC,
         4 => &WIDE65_DESC,
+        5 => &FAULTY_DESC,
         _ => std::ptr::null(),
     }
 }
@@ -607,6 +652,8 @@ unsafe extern "C" fn factory_create(_f: *const clap_plugin_factory, host: *const
         (&WIDE17_DESC as *const _, false, Some((17, 2)))
     } else if id == c"org.soundcraft.test.wide65ch" {
         (&WIDE65_DESC as *const _, false, Some((1, 65)))
+    } else if id == c"org.soundcraft.test.faulty" {
+        (&FAULTY_DESC as *const _, false, None)
     } else {
         return std::ptr::null();
     };
@@ -627,6 +674,7 @@ unsafe extern "C" fn factory_create(_f: *const clap_plugin_factory, host: *const
         },
         host,
         synth,
+        faulty: id == c"org.soundcraft.test.faulty",
         wide,
         gain: 1.0,
         mode: 0.0,

@@ -97,6 +97,15 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("mix.insert_bypass", "Bypass Insert", [], None, "{track?, slot, value?: bool}", has_selection, insert_bypass),
         cmd!("mix.insert_param", "Set Plugin Parameter", [], None, "{track?, slot, param, value}", has_selection, insert_param),
         cmd!(
+            "mix.insert_reset",
+            "Reset Plugin to Factory Default",
+            [],
+            None,
+            "{track?, slot}: clears every value SoundCraft stored for the insert and its saved state; the plugin starts over with its own defaults",
+            has_selection,
+            insert_reset
+        ),
+        cmd!(
             "mix.insert_params",
             "Set Plugin Parameters",
             [],
@@ -383,6 +392,20 @@ fn insert_param(e: &mut Engine, p: &Value) -> Result<Value> {
     let v = value.clamp(pi.min, pi.max);
     ins.params.insert(param, v);
     Ok(json!({"value": v}))
+}
+
+/// Factory Default: the plugin's own defaults, never the advertised ones. Every stored value goes,
+/// and the insert gets a new live-instance tag so a host recreates the plugin.
+fn insert_reset(e: &mut Engine, p: &Value) -> Result<Value> {
+    let (t, slot) = track_slot(e, p, "mix.insert_reset", INSERT_SLOTS)?;
+    let ins = e
+        .session_mut()
+        .track_mut(t)
+        .and_then(|tr| tr.mixer.inserts.get_mut(slot))
+        .and_then(Option::as_mut)
+        .ok_or_else(|| bad("mix.insert_reset", "empty slot"))?;
+    ins.reset_to_factory();
+    Ok(json!({"track": t, "slot": slot}))
 }
 
 /// Apply many parameters at once (preset recall); values are clamped. Unknown ids and

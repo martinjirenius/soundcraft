@@ -475,6 +475,8 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
                             let _ = app.run("mix.insert_bypass", json!({"track": tid.0, "slot": slot}));
                         }
                         ui.menu_button("Presets ▾", |ui| preset_menu(app, ui, tid, slot, info, &ins));
+                    } else if ui.button("Factory Default").clicked() {
+                        let _ = app.run("mix.instrument_reset", json!({"track": tid.0}));
                     }
                     if soundcraft_mix::is_third_party(&ins.plugin) {
                         let open = app.player.as_ref().is_some_and(|p| p.editor_open(tid, slot));
@@ -667,8 +669,7 @@ fn preset_menu(
     ins: &soundcraft_model::Insert,
 ) {
     if ui.button("<factory default>").clicked() {
-        let defaults: serde_json::Map<String, serde_json::Value> = info.params.iter().map(|p| (p.id.to_string(), json!(p.default))).collect();
-        let _ = app.run("mix.insert_params", json!({"track": tid.0, "slot": slot, "params": defaults, "preset": "<factory default>"}));
+        let _ = app.run("mix.insert_reset", json!({"track": tid.0, "slot": slot}));
         ui.close();
     }
     let Some(dir) = preset_dir(app, info.id) else {

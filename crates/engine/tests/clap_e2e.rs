@@ -104,7 +104,7 @@ fn clap_state_is_captured_stored_and_restored_before_the_first_block() {
     let mut io = vec![vec![0.0f32; 64]];
     p.process(&mut io, 64);
     let mut reader = p.state_reader().unwrap();
-    eng.adopt(vec![soundcraft_mix::PreparedInstance { track: t, slot: 0, id: gain.into(), ch: 1, plugin: p }]);
+    eng.adopt(vec![soundcraft_mix::PreparedInstance { track: t, slot: 0, id: gain.into(), ch: 1, instance: specs[0].instance, plugin: p }]);
     eng.ensure_synced(e.session());
     let blob = reader.save_state().unwrap();
     e.execute("mix.insert_state", &json!({"track": t.0, "slot": 0, "state": soundcraft_model::b64::encode(&blob)})).unwrap();
@@ -223,4 +223,74 @@ fn an_offline_render_answers_what_the_plugins_ask_of_the_host() {
         (first / 0.25 - later / 0.26).abs() < 1e-3,
         "the first block ran before the plugin could be called back, a later one after: {first} then {later}"
     );
+}
+
+/// A session with one gain insert and one live mix engine, so plugin instances survive between
+/// renders as they do in playback (`render_range` builds a fresh engine every call).
+struct Live {
+    e: Engine,
+    mix: soundcraft_mix::MixEngine,
+    pos: i64,
+    track: u64,
+}
+
+impl Live {
+    fn new(src: u64) -> Live {
+        install_fixture();
+        let mut e = Engine::default();
+        let s = e.session_mut();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        s.pool.insert(SourceId(src), Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.25; 48_000]] })));
+        let id = s.new_clip_id();
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "dc", SourceId(src), 0, 0, 48_000));
+        e.execute("mix.insert", &json!({"track": t.0, "plugin": "clap:org.soundcraft.test.gain"})).unwrap();
+        Live { e, mix: soundcraft_mix::MixEngine::new(48_000.0, 512), pos: 0, track: t.0 }
+    }
+
+    /// Renders a few consecutive blocks on the same engine and returns the last sample.
+    fn level(&mut self) -> f32 {
+        let mut out = vec![vec![0.0f32; 512]; 2];
+        for _ in 0..3 {
+            self.mix.render(self.e.session(), self.pos, 512, &mut out);
+            self.pos += 512;
+        }
+        out[0][500]
+    }
+
+    fn run(&mut self, cmd: &str, extra: serde_json::Value) {
+        let mut p = json!({"track": self.track, "slot": 0});
+        if let (Some(p), Some(x)) = (p.as_object_mut(), extra.as_object()) {
+            p.extend(x.clone());
+        }
+        self.e.execute(cmd, &p).unwrap();
+    }
+}
+
+/// Protects invariant 1 for Factory Default: resetting an insert clears everything SoundCraft
+/// stored and the live plugin starts over with its own default (gain 1.0), rather than keeping the
+/// value it had or being handed advertised defaults.
+#[test]
+fn factory_default_clears_what_was_stored_and_the_live_plugin_resets_itself() {
+    let mut l = Live::new(81);
+    let own = l.level();
+    assert!(own.abs() > 0.1);
+    l.run("mix.insert_param", json!({"param": "7", "value": 2.0}));
+    assert!((l.level() - 2.0 * own).abs() < 1e-4, "the set gain plays");
+    l.run("mix.insert_reset", json!({}));
+    assert!((l.level() - own).abs() < 1e-4, "the plugin is back at its own default gain");
+    let ins = l.e.session().tracks[0].mixer.inserts[0].as_ref().unwrap();
+    assert!(ins.params.is_empty() && ins.state.is_none(), "nothing stored: {:?}", ins.params);
+}
+
+/// Protects undo across an instance change: undoing a Factory Default brings the earlier gain
+/// back into the render, on the same live mix engine.
+#[test]
+fn undoing_factory_default_brings_the_earlier_gain_back() {
+    let mut l = Live::new(82);
+    let own = l.level();
+    l.run("mix.insert_param", json!({"param": "7", "value": 2.0}));
+    l.run("mix.insert_reset", json!({}));
+    assert!((l.level() - own).abs() < 1e-4);
+    l.e.execute("edit.undo", &json!({})).unwrap();
+    assert!((l.level() - 2.0 * own).abs() < 1e-4, "the earlier gain plays again");
 }

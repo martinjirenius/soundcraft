@@ -441,6 +441,42 @@ pub struct Insert {
     /// The session audio source a sample-playing instrument (the built-in Sampler) plays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample: Option<SourceId>,
+    /// Which live plugin instance this insert maps to. Not saved: a loaded insert gets a fresh tag.
+    /// A host recreates the instance when the tag differs from the one it built.
+    #[serde(skip, default = "InstanceTag::fresh")]
+    pub instance: InstanceTag,
+}
+
+/// Names the live plugin instance an [`Insert`] maps to, so a command can say "start this plugin
+/// over" without changing its plugin id or channel count. Tags come from a process-wide counter.
+///
+/// The tag is not document content: two tags always compare equal with `==`, so two documents are
+/// equal whichever live instances they map to. Hosts compare with [`InstanceTag::same_instance`].
+#[derive(Debug, Clone, Copy)]
+pub struct InstanceTag(u64);
+
+impl InstanceTag {
+    /// A tag no other instance has.
+    pub fn fresh() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        InstanceTag(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// True when both tags name the same live instance.
+    pub fn same_instance(&self, other: &InstanceTag) -> bool {
+        self.0 == other.0
+    }
+
+    /// The tag's number, for hashing into a structure fingerprint.
+    pub fn raw(&self) -> u64 {
+        self.0
+    }
+}
+
+impl PartialEq for InstanceTag {
+    fn eq(&self, _: &InstanceTag) -> bool {
+        true
+    }
 }
 
 fn yes() -> bool {
@@ -457,7 +493,18 @@ impl Insert {
             preset: String::from("<factory default>"),
             state: None,
             sample: None,
+            instance: InstanceTag::fresh(),
         }
+    }
+
+    /// Back to the plugin's own defaults: drops every stored value and the saved state, and tags the
+    /// insert anew so a host replaces the live instance (which then resets itself). The plugin,
+    /// bypass, active and sample stay as they are.
+    pub fn reset_to_factory(&mut self) {
+        self.params.clear();
+        self.state = None;
+        self.preset = String::from("<factory default>");
+        self.instance = InstanceTag::fresh();
     }
 
     /// The decoded plugin state (`None` when absent or malformed).

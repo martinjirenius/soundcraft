@@ -27,6 +27,15 @@ pub fn specs() -> Vec<CommandSpec> {
             has_selection,
             set_instrument_param
         ),
+        cmd!(
+            "mix.instrument_reset",
+            "Reset Instrument to Factory Default",
+            [],
+            None,
+            "{track?}: clears every value SoundCraft stored for the track's instrument and its saved state; the instrument starts over with its own defaults",
+            has_selection,
+            reset_instrument
+        ),
     ]
 }
 
@@ -83,6 +92,14 @@ fn set_instrument_param(e: &mut Engine, p: &Value) -> Result<Value> {
     let v = pi.clamp(value);
     ins.params.insert(param.clone(), v);
     Ok(json!({"track": t, "param": param, "value": v}))
+}
+
+fn reset_instrument(e: &mut Engine, p: &Value) -> Result<Value> {
+    let id = "mix.instrument_reset";
+    let t = tracks_required(e, id, p)?.first().copied().ok_or_else(|| bad(id, "no track"))?;
+    let ins = e.session_mut().track_mut(t).and_then(|tr| tr.instrument.as_mut()).ok_or_else(|| bad(id, "the track has no instrument"))?;
+    ins.reset_to_factory();
+    Ok(json!({"track": t}))
 }
 
 #[cfg(test)]

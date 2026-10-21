@@ -59,7 +59,7 @@ use soundcraft_dsp::pan::{PanLaw, SpeakerPos, SurroundParams, gains};
 use soundcraft_dsp::{Plugin, PluginService, SampleSource, Transport, db_to_gain};
 use soundcraft_midi::CtrlKind;
 use soundcraft_model::{
-    AutoParam, BusId, ChannelFormat, Clip, ClipContent, Route, Session, SourceAudio, Speaker, SurroundPan, Track, TrackId, TrackKind,
+    AutoParam, BusId, ChannelFormat, Clip, ClipContent, InstanceTag, Route, Session, SourceAudio, Speaker, SurroundPan, Track, TrackId, TrackKind,
 };
 use soundcraft_time::{Range, Samples, TICKS_PER_QUARTER};
 use std::collections::HashMap;
@@ -100,6 +100,8 @@ pub struct InstanceSpec {
     pub ch: usize,
     /// Decoded [`Insert::state`](soundcraft_model::Insert::state).
     pub state: Option<Vec<u8>>,
+    /// The live-instance tag of the insert this spec was made from.
+    pub instance: InstanceTag,
 }
 
 /// Where a host reads a hosted plugin's own current parameter value (SoundCraft units) from, for
@@ -117,6 +119,8 @@ pub struct PreparedInstance {
     pub slot: usize,
     pub id: String,
     pub ch: usize,
+    /// The tag of the [`InstanceSpec`] this instance was made for.
+    pub instance: InstanceTag,
     pub plugin: Box<dyn Plugin>,
 }
 
@@ -131,13 +135,20 @@ pub fn instance_specs(s: &Session) -> Vec<InstanceSpec> {
             if let Some(ins) = ins
                 && is_third_party(&ins.plugin)
             {
-                out.push(InstanceSpec { track: t.id, slot: i, id: ins.plugin.clone(), ch, state: ins.state_bytes() });
+                out.push(InstanceSpec { track: t.id, slot: i, id: ins.plugin.clone(), ch, state: ins.state_bytes(), instance: ins.instance });
             }
         }
         if let Some(ins) = &t.instrument
             && is_third_party(&ins.plugin)
         {
-            out.push(InstanceSpec { track: t.id, slot: INSTRUMENT_SLOT, id: ins.plugin.clone(), ch: ch.max(2), state: ins.state_bytes() });
+            out.push(InstanceSpec {
+                track: t.id,
+                slot: INSTRUMENT_SLOT,
+                id: ins.plugin.clone(),
+                ch: ch.max(2),
+                state: ins.state_bytes(),
+                instance: ins.instance,
+            });
         }
     }
     out
@@ -224,6 +235,8 @@ struct PluginSlot {
     id: String,
     /// Channel count the plugin was prepared for.
     ch: usize,
+    /// The insert's live-instance tag when this plugin was made.
+    instance: InstanceTag,
     plugin: Box<dyn Plugin>,
     /// Last values pushed to the plugin, in the insert's parameter-map order.
     applied: Vec<f32>,
@@ -420,7 +433,7 @@ impl SlotCtx<'_> {
         let third = is_third_party(&ins.plugin);
         let mut plugin = if third && self.external {
             match self.adopt.remove(&(t, idx)) {
-                Some(p) if p.id == ins.plugin && p.ch == ch => Some(p.plugin),
+                Some(p) if p.id == ins.plugin && p.ch == ch && p.instance.same_instance(&ins.instance) => Some(p.plugin),
                 Some(p) => {
                     self.retired.push(p.plugin);
                     None
@@ -432,7 +445,16 @@ impl SlotCtx<'_> {
             create_instance(&ins.plugin, state.as_deref(), self.sr, self.mb, ch).map(|n| n.plugin)
         }?;
         let service = if third && !self.external { plugin.service_handle() } else { None };
-        Some(PluginSlot { id: ins.plugin.clone(), ch, plugin, applied: Vec::new(), applied_lanes: Vec::new(), failed: false, service })
+        Some(PluginSlot {
+            id: ins.plugin.clone(),
+            ch,
+            instance: ins.instance,
+            plugin,
+            applied: Vec::new(),
+            applied_lanes: Vec::new(),
+            failed: false,
+            service,
+        })
     }
 }
 
@@ -576,7 +598,10 @@ impl MixEngine {
             strip.plugins.resize_with(t.mixer.inserts.len(), || None);
             for (idx, (slot, ins)) in strip.plugins.iter_mut().zip(t.mixer.inserts.iter()).enumerate() {
                 match ins {
-                    Some(i) if slot.as_ref().is_none_or(|p| p.id != i.plugin || p.ch != ch) || cx.waiting(t.id, idx) => {
+                    Some(i)
+                        if slot.as_ref().is_none_or(|p| p.id != i.plugin || p.ch != ch || !p.instance.same_instance(&i.instance))
+                            || cx.waiting(t.id, idx) =>
+                    {
                         let old = slot.take();
                         cx.retire(old);
                         *slot = cx.make(t.id, idx, i, ch);
@@ -591,6 +616,7 @@ impl MixEngine {
             let want = t.instrument.as_ref();
             let ich = ch.max(2);
             if strip.instrument.as_ref().map(|p| (p.id.as_str(), p.ch)) != want.map(|i| (i.plugin.as_str(), ich))
+                || strip.instrument.as_ref().zip(want).is_some_and(|(p, i)| !p.instance.same_instance(&i.instance))
                 || (want.is_some() && cx.waiting(t.id, INSTRUMENT_SLOT))
             {
                 let old = strip.instrument.take();
@@ -1269,12 +1295,12 @@ fn structure_fingerprint(s: &Session) -> usize {
         t.mixer.input.hash(&mut h);
         t.mixer.output.hash(&mut h);
         for i in &t.mixer.inserts {
-            i.as_ref().map(|x| x.plugin.as_str()).hash(&mut h);
+            i.as_ref().map(|x| (x.plugin.as_str(), x.instance.raw())).hash(&mut h);
         }
         for snd in t.mixer.sends.iter().flatten() {
             snd.target.hash(&mut h);
         }
-        t.instrument.as_ref().map(|x| x.plugin.as_str()).hash(&mut h);
+        t.instrument.as_ref().map(|x| (x.plugin.as_str(), x.instance.raw())).hash(&mut h);
         let sample = t.instrument.as_ref().and_then(|x| x.sample);
         sample.hash(&mut h);
         // Which decoded audio it is, so new audio under the same id (another session) re-syncs.
@@ -2348,6 +2374,13 @@ mod audio_thread_tests {
 
 #[cfg(test)]
 mod tests {
+    /// The live-instance tag of the insert (or instrument) a test's instance is made for.
+    fn tag(s: &Session, t: TrackId, slot: usize) -> soundcraft_model::InstanceTag {
+        let tr = s.track(t).unwrap();
+        let ins = if slot == INSTRUMENT_SLOT { tr.instrument.as_ref() } else { tr.mixer.inserts[slot].as_ref() };
+        ins.unwrap().instance
+    }
+
     use super::*;
     use soundcraft_audio_io::AudioBuffer;
     use soundcraft_model::{Insert, SourceAudio, SourceId};
@@ -2680,7 +2713,14 @@ mod tests {
         let clock = Clock { inner: soundcraft_dsp::create("gain").unwrap(), seen: Arc::clone(&seen) };
         let mut eng = MixEngine::new(48_000.0, 512);
         eng.set_external_instances(true);
-        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "clap:test.clock".into(), ch: 1, plugin: Box::new(clock) }]);
+        eng.adopt(vec![PreparedInstance {
+            track: t,
+            slot: 0,
+            id: "clap:test.clock".into(),
+            ch: 1,
+            instance: tag(&s, t, 0),
+            plugin: Box::new(clock),
+        }]);
         render_block(&mut eng, &s, 96_000);
         eng.monitor_only = true;
         render_block(&mut eng, &s, 96_000);
@@ -2735,7 +2775,14 @@ mod tests {
         let ears = Ears { inner: soundcraft_dsp::create("gain").unwrap(), heard: Arc::clone(&heard) };
         let mut eng = MixEngine::new(48_000.0, 512);
         eng.set_external_instances(true);
-        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.ears".into(), ch: 2, plugin: Box::new(ears) }]);
+        eng.adopt(vec![PreparedInstance {
+            track: t,
+            slot: INSTRUMENT_SLOT,
+            id: "clap:test.ears".into(),
+            ch: 2,
+            instance: tag(&s, t, INSTRUMENT_SLOT),
+            plugin: Box::new(ears),
+        }]);
         render_block(&mut eng, &s, 0);
         assert_eq!(std::mem::take(&mut *heard.lock().unwrap()), vec![(0, [0xB0, 121, 0]), (100, [0xB0, 64, 127])]);
         render_block(&mut eng, &s, 36_000);
@@ -2788,7 +2835,14 @@ mod tests {
         let keys = Keys { inner: soundcraft_dsp::create("gain").unwrap(), heard: Arc::clone(&heard) };
         let mut eng = MixEngine::new(48_000.0, 512);
         eng.set_external_instances(true);
-        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.keys".into(), ch: 2, plugin: Box::new(keys) }]);
+        eng.adopt(vec![PreparedInstance {
+            track: t,
+            slot: INSTRUMENT_SLOT,
+            id: "clap:test.keys".into(),
+            ch: 2,
+            instance: tag(&s, t, INSTRUMENT_SLOT),
+            plugin: Box::new(keys),
+        }]);
         render_block(&mut eng, &s, 0);
         assert_eq!(*heard.lock().unwrap(), vec![(72, 80)]);
     }
@@ -2806,7 +2860,7 @@ mod tests {
         ins.params.insert("gain".into(), -6.0);
         s.track_mut(t).unwrap().mixer.inserts[0] = Some(ins);
         let specs = instance_specs(&s);
-        assert_eq!(specs, vec![InstanceSpec { track: t, slot: 0, id: "clap:test.fake".into(), ch: 1, state: None }]);
+        assert_eq!(specs, vec![InstanceSpec { track: t, slot: 0, id: "clap:test.fake".into(), ch: 1, state: None, instance: tag(&s, t, 0) }]);
         let mut eng = MixEngine::new(48_000.0, 512);
         eng.set_external_instances(true);
         // Nothing to adopt yet: the slot passes audio through (and sync never tried to load a
@@ -2819,10 +2873,10 @@ mod tests {
         let fake = Stateful { inner: gain, blob: Vec::new(), sets: Arc::clone(&sets) };
         // An instance for the wrong channel count is retired, not used.
         let wrong = Stateful { inner: soundcraft_dsp::create("gain").unwrap(), blob: Vec::new(), sets: Arc::clone(&sets) };
-        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "clap:test.fake".into(), ch: 2, plugin: Box::new(wrong) }]);
+        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "clap:test.fake".into(), ch: 2, instance: tag(&s, t, 0), plugin: Box::new(wrong) }]);
         assert!(render_block(&mut eng, &s, 512) > 0.3);
         assert_eq!(eng.take_retired().len(), 1);
-        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "clap:test.fake".into(), ch: 1, plugin: Box::new(fake) }]);
+        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "clap:test.fake".into(), ch: 1, instance: tag(&s, t, 0), plugin: Box::new(fake) }]);
         let mut wet = 0.0;
         for b in 2..20 {
             wet = render_block(&mut eng, &s, b * 512);
@@ -2835,7 +2889,14 @@ mod tests {
         render_block(&mut eng, &s, 20 * 512);
         assert_eq!(eng.take_retired().len(), 1);
         // Instances nobody claims are retired too; drain_plugins empties the engine.
-        eng.adopt(vec![PreparedInstance { track: t, slot: 3, id: "clap:x".into(), ch: 1, plugin: soundcraft_dsp::create("gain").unwrap() }]);
+        eng.adopt(vec![PreparedInstance {
+            track: t,
+            slot: 3,
+            id: "clap:x".into(),
+            ch: 1,
+            instance: soundcraft_model::InstanceTag::fresh(),
+            plugin: soundcraft_dsp::create("gain").unwrap(),
+        }]);
         render_block(&mut eng, &s, 21 * 512);
         assert_eq!(eng.take_retired().len(), 1);
         assert!(eng.drain_plugins().is_empty());
@@ -2894,8 +2955,15 @@ mod tests {
         }
     }
 
-    fn nan(track: TrackId, slot: usize, ch: usize) -> Vec<PreparedInstance> {
-        vec![PreparedInstance { track, slot, id: "clap:test.nan".into(), ch, plugin: Box::new(Nan(soundcraft_dsp::create("gain").unwrap())) }]
+    fn nan(s: &Session, track: TrackId, slot: usize, ch: usize) -> Vec<PreparedInstance> {
+        vec![PreparedInstance {
+            track,
+            slot,
+            id: "clap:test.nan".into(),
+            ch,
+            instance: tag(s, track, slot),
+            plugin: Box::new(Nan(soundcraft_dsp::create("gain").unwrap())),
+        }]
     }
 
     #[test]
@@ -2906,7 +2974,7 @@ mod tests {
         let mut eng = MixEngine::new(48_000.0, 512);
         eng.set_external_instances(true);
         let both = render_block(&mut eng, &s, 0);
-        eng.adopt(nan(a, 2, 1));
+        eng.adopt(nan(&s, a, 2, 1));
         let only_b = render_block(&mut eng, &s, 512);
         assert!(only_b > 0.3 && (only_b - both / 2.0).abs() < 1e-6, "{only_b} vs {both}");
         assert_eq!(eng.meters[&a].plugin_failures, PluginFailures { count: 1, last: 2 });
@@ -2927,11 +2995,11 @@ mod tests {
         let mut eng = MixEngine::new(48_000.0, 512);
         eng.set_external_instances(true);
         let both = render_block(&mut eng, &s, 0);
-        let failing = |track, slot, ch| {
+        let failing = |s: &Session, track, slot, ch| {
             let plugin = Box::new(Failing(soundcraft_dsp::create("gain").unwrap()));
-            vec![PreparedInstance { track, slot, id: "clap:test.failing".into(), ch, plugin }]
+            vec![PreparedInstance { track, slot, id: "clap:test.failing".into(), ch, instance: tag(s, track, slot), plugin }]
         };
-        eng.adopt(failing(a, 2, 1));
+        eng.adopt(failing(&s, a, 2, 1));
         let only_b = render_block(&mut eng, &s, 512);
         assert!(only_b > 0.3 && (only_b - both / 2.0).abs() < 1e-6, "{only_b} vs {both}");
         assert_eq!(eng.meters[&a].plugin_failures, PluginFailures { count: 1, last: 2 });
@@ -2949,7 +3017,14 @@ mod tests {
         let mut eng = MixEngine::new(48_000.0, 512);
         eng.set_external_instances(true);
         let plugin = Box::new(Failing(soundcraft_dsp::create("gain").unwrap()));
-        eng.adopt(vec![PreparedInstance { track: synth, slot: INSTRUMENT_SLOT, id: "clap:test.failing".into(), ch: 2, plugin }]);
+        eng.adopt(vec![PreparedInstance {
+            track: synth,
+            slot: INSTRUMENT_SLOT,
+            id: "clap:test.failing".into(),
+            ch: 2,
+            instance: tag(&s, synth, INSTRUMENT_SLOT),
+            plugin,
+        }]);
         let only_b = render_block(&mut eng, &s, 0);
         assert!(only_b > 0.3, "{only_b}");
         assert_eq!(eng.meters[&synth].plugin_failures, PluginFailures { count: 1, last: INSTRUMENT_SLOT });
@@ -2964,14 +3039,14 @@ mod tests {
         let b = add_dc_track(&mut s, 0.5, 48_000);
         let mut eng = MixEngine::new(48_000.0, 512);
         eng.set_external_instances(true);
-        eng.adopt(nan(synth, INSTRUMENT_SLOT, 2));
+        eng.adopt(nan(&s, synth, INSTRUMENT_SLOT, 2));
         let only_b = render_block(&mut eng, &s, 0);
         assert!(only_b > 0.3, "{only_b}");
         assert_eq!(eng.meters[&synth].plugin_failures, PluginFailures { count: 1, last: INSTRUMENT_SLOT });
         assert_eq!(eng.meters[&b].plugin_failures, PluginFailures::default());
         let m = s.add_track(TrackKind::Master, ChannelFormat::Stereo, None);
         s.track_mut(m).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.nan"));
-        eng.adopt(nan(m, 0, 2));
+        eng.adopt(nan(&s, m, 0, 2));
         assert_eq!(render_block(&mut eng, &s, 512), 0.0);
         assert_eq!(eng.meters[&m].plugin_failures, PluginFailures { count: 1, last: 0 });
         assert_eq!(render_block(&mut eng, &s, 1024), only_b);
@@ -3017,7 +3092,14 @@ mod tests {
                 plugin.prepare(48_000.0, block, 2);
                 let mut eng = MixEngine::new(48_000.0, block);
                 eng.set_external_instances(true);
-                eng.adopt(vec![PreparedInstance { track: target, slot: 0, id: "clap:test.nan".into(), ch: 2, plugin: Box::new(Nan(plugin)) }]);
+                eng.adopt(vec![PreparedInstance {
+                    track: target,
+                    slot: 0,
+                    id: "clap:test.nan".into(),
+                    ch: 2,
+                    instance: tag(&s, target, 0),
+                    plugin: Box::new(Nan(plugin)),
+                }]);
                 let mut out = vec![vec![0.0; block]; 2];
                 eng.render(&s, 0, block, &mut out);
                 assert!(out.iter().flatten().all(|x| *x == 0.0));
@@ -3058,10 +3140,10 @@ mod tests {
             gain.prepare(48_000.0, 512, 1);
             Box::new(Stateful { inner: gain, blob: blob.to_vec(), sets: Arc::clone(&sets) })
         };
-        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "clap:test.fake".into(), ch: 1, plugin: make(b"old") }]);
+        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "clap:test.fake".into(), ch: 1, instance: tag(&s, t, 0), plugin: make(b"old") }]);
         render_block(&mut eng, &s, 0);
         assert!(eng.take_retired().is_empty());
-        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "clap:test.fake".into(), ch: 1, plugin: make(b"new") }]);
+        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "clap:test.fake".into(), ch: 1, instance: tag(&s, t, 0), plugin: make(b"new") }]);
         render_block(&mut eng, &s, 512);
         let mut retired = eng.take_retired();
         assert_eq!(retired.len(), 1, "the old instance is retired");
@@ -3080,7 +3162,14 @@ mod tests {
         eng.set_external_instances(true);
         let sets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fake = Stateful { inner: soundcraft_dsp::create("gain").unwrap(), blob: Vec::new(), sets: Arc::clone(&sets) };
-        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "vst3:00000000000000000000000000000001".into(), ch: 1, plugin: Box::new(fake) }]);
+        eng.adopt(vec![PreparedInstance {
+            track: t,
+            slot: 0,
+            id: "vst3:00000000000000000000000000000001".into(),
+            ch: 1,
+            instance: tag(&s, t, 0),
+            plugin: Box::new(fake),
+        }]);
         render_block(&mut eng, &s, 0);
         assert_eq!(sets.load(std::sync::atomic::Ordering::Relaxed), 1, "session params apply once");
         render_block(&mut eng, &s, 512);
@@ -3297,7 +3386,14 @@ mod tests {
             s.track_mut(track).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.latent"));
             let mut gain = soundcraft_dsp::create("gain").unwrap();
             gain.prepare(48_000.0, 512, 1);
-            eng.adopt(vec![PreparedInstance { track, slot: 0, id: "clap:test.latent".into(), ch: 1, plugin: Box::new(Latent(gain)) }]);
+            eng.adopt(vec![PreparedInstance {
+                track,
+                slot: 0,
+                id: "clap:test.latent".into(),
+                ch: 1,
+                instance: tag(&s, track, 0),
+                plugin: Box::new(Latent(gain)),
+            }]);
         }
         render_block(&mut eng, &s, 0);
         assert_eq!((eng.track_latency, eng.latency), (MAX_LATENCY, 2 * MAX_LATENCY));

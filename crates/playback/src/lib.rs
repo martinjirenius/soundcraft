@@ -29,7 +29,7 @@ pub use devices::AudioConfig;
 
 use soundcraft_dsp::{Plugin, PluginEditor, PluginService, PluginStateReader};
 use soundcraft_mix::{LiveParams, MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
-use soundcraft_model::{Session, TrackId};
+use soundcraft_model::{InstanceTag, Session, TrackId};
 use soundcraft_time::{Range, Samples};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
@@ -430,7 +430,7 @@ impl AudioState {
 /// UI-thread bookkeeping of the third-party instances the audio thread holds.
 struct Side {
     /// What was last created for each slot: (plugin id, channels, created ok).
-    shadow: HashMap<(TrackId, usize), (String, usize, bool)>,
+    shadow: HashMap<(TrackId, usize), (String, usize, InstanceTag, bool)>,
     /// Session sample rate the instances were prepared for.
     rate: f32,
     /// Editor handles of the live instances.
@@ -901,13 +901,13 @@ impl Side {
         let mut out = Vec::new();
         for spec in specs {
             let key = (spec.track, spec.slot);
-            if self.shadow.get(&key).is_some_and(|(id, ch, _)| *id == spec.id && *ch == spec.ch) {
+            if self.shadow.get(&key).is_some_and(|(id, ch, tag, _)| *id == spec.id && *ch == spec.ch && tag.same_instance(&spec.instance)) {
                 continue;
             }
             self.forget(key);
             let made = soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), sr, BLOCK, spec.ch);
             log::debug!("plugin instance for {:?} slot {}: {} ({} ch, created: {})", spec.track, spec.slot, spec.id, spec.ch, made.is_some());
-            self.shadow.insert(key, (spec.id.clone(), spec.ch, made.is_some()));
+            self.shadow.insert(key, (spec.id.clone(), spec.ch, spec.instance, made.is_some()));
             if let Some(soundcraft_mix::NewInstance { mut plugin, refused_state }) = made {
                 if let Some(e) = plugin.editor() {
                     self.editors.insert(key, e);
@@ -921,7 +921,7 @@ impl Side {
                 if refused_state {
                     self.refused.insert(key);
                 }
-                out.push(PreparedInstance { track: spec.track, slot: spec.slot, id: spec.id, ch: spec.ch, plugin });
+                out.push(PreparedInstance { track: spec.track, slot: spec.slot, id: spec.id, ch: spec.ch, instance: spec.instance, plugin });
             }
         }
         out
@@ -1352,6 +1352,7 @@ mod tests {
         let mut s = soundcraft_model::Session::default();
         let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
         s.track_mut(t).unwrap().mixer.inserts[1] = Some(Insert::new("clap:test.fake"));
+        let tag = s.track(t).unwrap().mixer.inserts[1].as_ref().unwrap().instance;
         let s = Arc::new(s);
         let shared = Arc::new(Shared {
             position: AtomicI64::new(0),
@@ -1363,7 +1364,11 @@ mod tests {
         let (gtx, grx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(soundcraft_model::Session::default()), 48_000.0, gtx);
         let plugin = soundcraft_dsp::create("gain").unwrap();
-        tx.send(Cmd::Session(Arc::clone(&s), vec![PreparedInstance { track: t, slot: 1, id: "clap:test.fake".into(), ch: 2, plugin }])).unwrap();
+        tx.send(Cmd::Session(
+            Arc::clone(&s),
+            vec![PreparedInstance { track: t, slot: 1, id: "clap:test.fake".into(), ch: 2, instance: tag, plugin }],
+        ))
+        .unwrap();
         let mut out = vec![0.0f32; 256];
         st.fill(&mut out, 2);
         assert!(grx.try_recv().is_err(), "nothing retired yet");
@@ -1374,7 +1379,14 @@ mod tests {
         // A sample-rate change rebuilds the engine without dropping plugins on this thread.
         tx.send(Cmd::Session(
             Arc::clone(&s),
-            vec![PreparedInstance { track: t, slot: 1, id: "clap:test.fake".into(), ch: 2, plugin: soundcraft_dsp::create("gain").unwrap() }],
+            vec![PreparedInstance {
+                track: t,
+                slot: 1,
+                id: "clap:test.fake".into(),
+                ch: 2,
+                instance: tag,
+                plugin: soundcraft_dsp::create("gain").unwrap(),
+            }],
         ))
         .unwrap();
         st.fill(&mut out, 2);
@@ -1473,7 +1485,8 @@ mod tests {
         s.track_mut(t).unwrap().mixer.inserts[0] = Some(Insert::new("clap:does.not.exist"));
         s.track_mut(t).unwrap().mixer.inserts[1] = Some(Insert::new("gain"));
         assert!(side.prepare(&s).is_empty(), "the plugin is not installed; built-ins stay with the engine");
-        assert_eq!(side.shadow.get(&(t, 0)), Some(&("clap:does.not.exist".to_string(), 1, false)));
+        let shadow = side.shadow.get(&(t, 0)).map(|(id, ch, _, made)| (id.as_str(), *ch, *made));
+        assert_eq!(shadow, Some(("clap:does.not.exist", 1, false)));
         assert!(side.prepare(&s).is_empty());
         assert_eq!(side.shadow.len(), 1, "failures are remembered, not retried every update");
         s.track_mut(t).unwrap().mixer.inserts[0] = None;

@@ -134,6 +134,9 @@ pub struct Recorder {
     pub device_name: String,
     /// Display name of the audio host the device belongs to (see [`crate::host`]).
     pub host_name: String,
+    /// The id (as in [`crate::AudioConfig::input`]) of the device actually opened: not the chosen
+    /// one when that was missing and the default stood in.
+    pub device_id: Option<String>,
     pub sample_rate: u32,
     pub channels: usize,
     /// The take writer, and what each track's take holds so far.
@@ -194,7 +197,7 @@ fn build_input(
             move |e: cpal::Error| {
                 // Possibly the audio thread (see `crate::mark_audio_thread`).
                 crate::mark_audio_thread();
-                if e.kind() == cpal::ErrorKind::DeviceNotAvailable {
+                if crate::host::stream_lost(e.kind()) {
                     let _ = errors.fault.compare_exchange(0, GONE, Ordering::Relaxed, Ordering::Relaxed);
                 }
                 log::warn!("input stream error: {e}");
@@ -236,6 +239,7 @@ impl Recorder {
         crate::host::configure(audio);
         let (device, host_name) = crate::host::default_device(crate::host::Direction::Input).map_err(|_| "no audio input device")?;
         let name = crate::host::device_label(&device, "Input");
+        let device_id = crate::host::device_id(&device);
         // At the chosen rate when the device offers it, so input and output run together: the
         // best format first, then the most channels.
         let at_rate = audio.sample_rate.and_then(|r| {
@@ -291,6 +295,7 @@ impl Recorder {
             _stream: Some(stream),
             device_name: name,
             host_name,
+            device_id,
             sample_rate: config.sample_rate,
             channels,
             writer: None,
@@ -520,6 +525,7 @@ mod tests {
             #[cfg(not(target_os = "freebsd"))]
             _stream: None,
             host_name: String::new(),
+            device_id: None,
             device_name: "Mic In".into(),
             sample_rate: 48_000,
             channels: 1,

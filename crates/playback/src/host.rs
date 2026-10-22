@@ -85,13 +85,109 @@ pub fn force_host(id: Option<&str>) {
 /// and `input` are ids from [`output_devices`] and [`input_devices`]. A forced host
 /// ([`force_host`]) wins, and then the devices of another host are not used.
 pub fn configure(cfg: &crate::AudioConfig) {
+    let (system, forced) = chosen_host(cfg);
+    set_preferred_host(forced.as_deref().or(system.as_deref()));
+    let (output, input) = chosen_devices(cfg);
+    set_preferred_output_device(output.as_deref());
+    set_preferred_input_device(input.as_deref());
+    set_preferred_buffer_size(cfg.buffer_size);
+}
+
+/// The host `cfg` names and the forced one, both normalised.
+fn chosen_host(cfg: &crate::AudioConfig) -> (Option<String>, Option<String>) {
     let system = cfg.system.as_deref().map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty() && s != "auto");
     let forced = FORCED.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    (system, forced)
+}
+
+/// The output and input device ids `cfg` chooses, unless a forced host makes them another host's.
+fn chosen_devices(cfg: &crate::AudioConfig) -> (Option<String>, Option<String>) {
+    let (system, forced) = chosen_host(cfg);
     let own_devices = forced.is_none() || forced == system;
-    set_preferred_host(forced.as_deref().or(system.as_deref()));
-    set_preferred_output_device(cfg.output.as_deref().filter(|_| own_devices));
-    set_preferred_input_device(cfg.input.as_deref().filter(|_| own_devices));
-    set_preferred_buffer_size(cfg.buffer_size);
+    (cfg.output.clone().filter(|_| own_devices), cfg.input.clone().filter(|_| own_devices))
+}
+
+/// Whether a stream error means the stream is dead and must be reopened: the device went away
+/// (`DeviceNotAvailable`) or the host dropped the stream (`StreamInvalidated`, which is what the
+/// PipeWire host reports when its target node is removed).
+pub(crate) fn stream_lost(kind: cpal::ErrorKind) -> bool {
+    matches!(kind, cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::StreamInvalidated)
+}
+
+/// The id of `device` in the form [`crate::AudioConfig::output`] and `input` hold.
+pub(crate) fn device_id(device: &cpal::Device) -> Option<String> {
+    use cpal::traits::DeviceTrait;
+    device.id().ok().map(|id| id.to_string())
+}
+
+/// Watches, off the calling thread, for the devices `cfg` chooses to be present: one thread
+/// looks every couple of seconds (listing devices can take tens of milliseconds, too long for a
+/// UI frame) and stops once they are all there or when the watch drops.
+pub struct DeviceWatch {
+    found: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DeviceWatch {
+    /// Start watching for the chosen output and input of `cfg`. Without a chosen device it is
+    /// found at once.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new(cfg: &crate::AudioConfig) -> DeviceWatch {
+        use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
+        use std::time::Duration;
+        let (output, input) = chosen_devices(cfg);
+        let wanted: Vec<String> = output.into_iter().chain(input).collect();
+        let found = Arc::new(AtomicBool::new(wanted.is_empty()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (f, s) = (Arc::clone(&found), Arc::clone(&stop));
+        let thread = std::thread::Builder::new()
+            .name("device-watch".into())
+            .spawn(move || {
+                while !s.load(Ordering::Relaxed) && !f.load(Ordering::Relaxed) {
+                    // Short sleeps, so dropping the watch does not wait out a whole period.
+                    for _ in 0..20 {
+                        if s.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    if wanted.iter().all(|id| device_present(id)) {
+                        f.store(true, Ordering::Relaxed);
+                    }
+                }
+            })
+            .ok();
+        DeviceWatch { found, stop, thread }
+    }
+
+    /// There is no device to wait for on the web.
+    #[cfg(target_arch = "wasm32")]
+    pub fn new(_cfg: &crate::AudioConfig) -> DeviceWatch {
+        DeviceWatch { found: Default::default(), stop: Default::default(), thread: None }
+    }
+
+    /// Every chosen device has been seen.
+    pub fn found(&self) -> bool {
+        self.found.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for DeviceWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Whether the device with this id is listed by its host right now.
+#[cfg(not(target_arch = "wasm32"))]
+fn device_present(id: &str) -> bool {
+    use cpal::traits::HostTrait;
+    let Ok(id) = id.parse::<cpal::DeviceId>() else { return false };
+    cpal::host_from_id(id.host()).is_ok_and(|host| host.device_by_id(&id).is_some())
 }
 
 /// Prefer a host by id for the devices opened from now on; `None` (or an empty id) returns to the
@@ -441,6 +537,15 @@ mod tests {
 
     fn ids(v: &[&str]) -> Vec<String> {
         v.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn a_stream_the_host_invalidated_counts_as_lost_like_a_missing_device() {
+        // Protects the bug found with a removed PipeWire node: StreamInvalidated was shown as a stall.
+        assert!(stream_lost(cpal::ErrorKind::StreamInvalidated));
+        assert!(stream_lost(cpal::ErrorKind::DeviceNotAvailable));
+        assert!(!stream_lost(cpal::ErrorKind::DeviceBusy));
+        assert!(!stream_lost(cpal::ErrorKind::RealtimeDenied));
     }
 
     #[test]

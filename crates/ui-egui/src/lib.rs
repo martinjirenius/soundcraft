@@ -258,6 +258,11 @@ pub struct SoundApp {
     /// Punch range to trim the take to (pre/post-roll recordings).
     punch: Option<Range>,
     recorder_failed: bool,
+    /// Held while the open devices are not the chosen ones: tells when the chosen ones are back.
+    device_watch: Option<soundcraft_playback::host::DeviceWatch>,
+    /// The chosen devices were back but the reopen did not land on them: do not try again until
+    /// the fallback ends, or every watch period would rebuild the player.
+    watch_gave_up: bool,
     /// Input this take lost to a slow disk, as last reported (ms).
     lost_shown: u64,
     /// Where the takes being recorded go, autosaved with the session so a crash can't lose them.
@@ -347,6 +352,16 @@ fn automation_step_due(pos: Samples, last: Samples, step: Samples) -> bool {
     last == i64::MIN || pos.saturating_sub(last) >= step || last.saturating_sub(pos) >= step
 }
 
+/// Whether the device actually open (`open`) is not the one chosen (`chosen`): the default stood
+/// in for a missing device, or nothing opened.
+fn on_fallback(chosen: Option<&str>, open: Option<&str>) -> bool {
+    chosen.is_some_and(|c| open != Some(c))
+}
+
+fn output_on_fallback(cfg: &soundcraft_playback::AudioConfig, player: &Player) -> bool {
+    on_fallback(cfg.output.as_deref(), player.device_id.as_deref())
+}
+
 impl SoundApp {
     pub fn new(engine: Engine, player: Option<Player>, services: Services) -> Self {
         SoundApp {
@@ -358,6 +373,8 @@ impl SoundApp {
             record_start: 0,
             punch: None,
             recorder_failed: false,
+            device_watch: None,
+            watch_gave_up: false,
             lost_shown: 0,
             take_plan: None,
             ui: UiState::default(),
@@ -817,6 +834,13 @@ impl SoundApp {
             return Err("stop recording before changing the audio device".into());
         }
         self.ui.audio = cfg;
+        self.reopen_audio();
+        Ok(())
+    }
+
+    /// Reopen the output with `ui.audio`, keeping the transport position; the input reopens on the
+    /// next record or monitor. Plugin instances and their editors are recreated with the player.
+    fn reopen_audio(&mut self) {
         let at = self.position();
         if let Some(p) = &self.player {
             p.stop();
@@ -824,7 +848,6 @@ impl SoundApp {
             // closed here, on the main thread, or they would stay on screen orphaned.
             p.close_editors();
         }
-        // The input reopens on the next record or monitor with the new choice.
         self.recorder = None;
         self.recorder_failed = false;
         // The old stream goes first: two streams of one client on one device make some hosts
@@ -833,7 +856,6 @@ impl SoundApp {
         let player = soundcraft_playback::Player::with_config(self.engine.session_arc(), &self.ui.audio);
         player.locate(at);
         self.player = Some(player);
-        Ok(())
     }
 
     /// Open the input device once (for recording and input monitoring) and feed the player.
@@ -863,17 +885,30 @@ impl SoundApp {
         let (cause, then) = match trouble {
             OutputTrouble::Bug => (
                 "the audio engine hit an internal error (see the log)".to_string(),
-                "Use Reconnect audio device in Setup ▸ Playback Engine, or restart SoundCraft.",
+                "Use Reconnect audio device in Setup ▸ Playback Engine, or restart SoundCraft.".to_string(),
             ),
-            OutputTrouble::Gone => {
-                (format!("“{name}” was disconnected"), "Plug it back in, then use Reconnect audio device in Setup ▸ Playback Engine.")
+            OutputTrouble::Gone => (format!("“{name}” was disconnected"), String::new()),
+            OutputTrouble::Stalled => {
+                (format!("“{name}” stopped asking for audio"), "Use Reconnect audio device in Setup ▸ Playback Engine.".to_string())
             }
-            OutputTrouble::Stalled => (format!("“{name}” stopped asking for audio"), "Use Reconnect audio device in Setup ▸ Playback Engine."),
         };
         let (recording, playing) = (self.engine.transport.recording, self.engine.transport.playing);
         if recording || playing {
             self.stop_play();
         }
+        // A lost device recovers by itself: carry on through the system default.
+        let then = if matches!(trouble, OutputTrouble::Gone) {
+            self.reopen_audio();
+            self.watch_gave_up = false;
+            match &self.player {
+                Some(p) if p.silent => "There is no audio output until it is back.".to_string(),
+                Some(p) if output_on_fallback(&self.ui.audio, p) => format!("Playing through “{}” until it is back.", p.device_name),
+                Some(p) => format!("Playing through “{}”.", p.device_name),
+                None => String::new(),
+            }
+        } else {
+            then
+        };
         self.ui.status = if recording {
             format!("Recording stopped: {cause}. The take is kept up to there. {then}")
         } else if playing {
@@ -901,9 +936,11 @@ impl SoundApp {
         }
         let (what, then) = match trouble {
             Trouble::Device(what) => {
+                // The next record or monitor reopens the input, on the default if the chosen one is gone.
                 self.recorder = None;
-                self.recorder_failed = true;
-                (what, "Reconnect it, then use Reconnect audio device in Setup ▸ Playback Engine.")
+                self.recorder_failed = false;
+                self.watch_gave_up = false;
+                (what, "The input switches to the system default until it is back.")
             }
             Trouble::Disk(what) => (what, "Check the disk, then record again."),
         };
@@ -914,19 +951,49 @@ impl SoundApp {
         };
     }
 
+    /// While the open devices are not the chosen ones, watch for the chosen ones and return to
+    /// them once they are back and the transport is idle.
+    fn watch_chosen_devices(&mut self, ctx: &egui::Context) {
+        let output_off = self.player.as_ref().is_some_and(|p| output_on_fallback(&self.ui.audio, p));
+        let input_off = self.recorder.as_ref().is_some_and(|r| on_fallback(self.ui.audio.input.as_deref(), r.device_id.as_deref()));
+        if !(output_off || input_off) {
+            self.device_watch = None;
+            self.watch_gave_up = false;
+            return;
+        }
+        if self.watch_gave_up {
+            return;
+        }
+        let watch = self.device_watch.get_or_insert_with(|| soundcraft_playback::host::DeviceWatch::new(&self.ui.audio));
+        // The watch thread cannot wake an idle window.
+        ctx.request_repaint_after_secs(1.0);
+        if !watch.found() || self.engine.transport.playing || self.engine.transport.recording {
+            return;
+        }
+        self.device_watch = None;
+        if output_off {
+            self.reopen_audio();
+        } else {
+            self.recorder = None;
+            self.recorder_failed = false;
+        }
+        let still_off = self.player.as_ref().is_some_and(|p| output_on_fallback(&self.ui.audio, p));
+        if still_off {
+            self.watch_gave_up = true;
+        } else {
+            self.ui.status = match &self.player {
+                Some(p) if output_off => format!("“{}” is back.", p.device_name),
+                _ => "The chosen audio input is back.".to_string(),
+            };
+        }
+    }
+
     /// Reopen the audio devices, keeping a take in progress.
     pub fn reconnect_audio(&mut self) {
         if self.is_playing() || self.engine.transport.recording {
             self.stop_play();
         }
-        if let Some(p) = &self.player {
-            // Its plugin editors go with it; closed here, on the main thread (see `apply_audio_config`).
-            p.close_editors();
-        }
-        self.recorder = None;
-        self.recorder_failed = false;
-        self.player = None;
-        self.player = Some(Player::with_config(self.engine.session_arc(), &self.ui.audio));
+        self.reopen_audio();
     }
 
     fn finish_recording(&mut self) {
@@ -1189,6 +1256,7 @@ impl SoundApp {
         }
         self.watch_output();
         self.watch_input();
+        self.watch_chosen_devices(ctx);
         // Stop the old playback before sending a replacement session to the audio thread.
         self.handle_transport(dt);
         if self.engine.revision != self.last_rev {
@@ -1360,6 +1428,15 @@ fn failed_plugin_status(s: &soundcraft_model::Session, track: TrackId, slot: usi
 mod tests {
     use super::{Services, SoundApp, automation_step_due};
     use serde_json::json;
+
+    #[test]
+    fn only_a_chosen_device_that_is_not_the_open_one_is_a_fallback() {
+        // Protects the return to a chosen device: no chosen device never watches, a silent clock always does.
+        assert!(!super::on_fallback(None, Some("a")));
+        assert!(!super::on_fallback(Some("a"), Some("a")));
+        assert!(super::on_fallback(Some("a"), Some("b")));
+        assert!(super::on_fallback(Some("a"), None));
+    }
 
     #[test]
     fn new_session_stops_playback_and_the_old_clock() {

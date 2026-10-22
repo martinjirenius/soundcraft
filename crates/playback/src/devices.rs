@@ -66,10 +66,6 @@ pub struct AudioSystem {
     pub inputs: Vec<DeviceInfo>,
 }
 
-fn device_id(d: &cpal::Device) -> Option<String> {
-    d.id().ok().map(|id| id.to_string())
-}
-
 /// What the settings window needs to know about a listed device. A JACK port group has no cpal
 /// device behind it: its rate and buffer are the server's.
 fn describe(info: crate::host::DeviceInfo, device: Option<&cpal::Device>, default_id: Option<&str>, output: bool) -> DeviceInfo {
@@ -112,8 +108,8 @@ pub fn audio_systems() -> Vec<AudioSystem> {
             use crate::host::Direction;
             let host = cpal::host_from_id(id).ok()?;
             let name = id.name().to_string();
-            let def_out = host.default_output_device().as_ref().and_then(device_id);
-            let def_in = host.default_input_device().as_ref().and_then(device_id);
+            let def_out = host.default_output_device().as_ref().and_then(crate::host::device_id);
+            let def_in = host.default_input_device().as_ref().and_then(crate::host::device_id);
             let list = |direction: Direction, default: Option<&str>| -> Vec<DeviceInfo> {
                 let output = direction == Direction::Output;
                 crate::host::listed(&host, &name, direction)

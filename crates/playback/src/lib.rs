@@ -571,6 +571,9 @@ pub struct Player {
     /// Display name of the audio host the device belongs to (`"ALSA"`, `"JACK"`, `"PipeWire"`, …);
     /// empty for the silent clock.
     pub host_name: String,
+    /// The id (as in [`AudioConfig::output`]) of the device actually opened: not the chosen one
+    /// when that was missing and the default stood in. `None` for the silent clock.
+    pub device_id: Option<String>,
     pub device_rate: u32,
     /// Output channels the device was opened with (0 for the silent clock).
     pub device_channels: u16,
@@ -627,6 +630,7 @@ impl Player {
         let new_side = |garbage: Receiver<Vec<Box<dyn Plugin>>>| Mutex::new(Side::new(side_rate, garbage));
         match open_device(want, want_ch, cfg) {
             Ok((device, config, format, name, host_name)) => {
+                let device_id = host::device_id(&device);
                 // The chosen buffer size first; if the device refuses it, its default.
                 let mut attempts = vec![config];
                 if config.buffer_size != cpal::BufferSize::Default {
@@ -671,6 +675,7 @@ impl Player {
                             clock: None,
                             device_name: name,
                             host_name,
+                            device_id,
                             device_rate: rate,
                             device_channels: config.channels,
                             device_buffer: buffer,
@@ -756,6 +761,7 @@ impl Player {
             clock,
             device_name: "No audio device (silent)".into(),
             host_name: String::new(),
+            device_id: None,
             device_rate: rate,
             device_channels: 0,
             device_buffer: None,
@@ -780,6 +786,7 @@ impl Player {
             _stream: None,
             device_name: "No audio device".into(),
             host_name: String::new(),
+            device_id: None,
             device_rate: session.sample_rate.hz(),
             device_channels: 0,
             device_buffer: None,
@@ -1160,7 +1167,7 @@ fn build_output(
             // broken): marked, so the logger hands the record off instead of writing it.
             move |e: cpal::Error| {
                 mark_audio_thread();
-                if e.kind() == cpal::ErrorKind::DeviceNotAvailable {
+                if host::stream_lost(e.kind()) {
                     gone.gone.store(true, Ordering::Relaxed);
                 }
                 log::warn!("audio stream error: {e}");

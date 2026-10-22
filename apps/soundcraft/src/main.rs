@@ -26,8 +26,14 @@ mod native_menu;
 use soundcraft_engine::Engine;
 use soundcraft_ui_egui::{Services, SoundApp, UiState, dialogs};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-struct App(SoundApp, Option<&'static logging::AppLogger>, #[cfg(target_os = "macos")] Option<native_menu::NativeMenu>);
+/// How often changed settings are written to `ui.json`.
+const PREFS_CHECK: Duration = Duration::from_secs(1);
+
+/// The app, its logger, the saver for settings changes and when it last checked them, then the
+/// macOS menu bar (last, so the other indices are the same on every platform).
+struct App(SoundApp, Option<&'static logging::AppLogger>, config::PrefsSaver, Instant, #[cfg(target_os = "macos")] Option<native_menu::NativeMenu>);
 
 /// Sends the title only when it changes, remembered here as X11 and Wayland can't read it back.
 fn set_title(ctx: &egui::Context, title: String) {
@@ -45,12 +51,12 @@ impl eframe::App for App {
             logger.report_audio_thread();
         }
         #[cfg(target_os = "macos")]
-        if let Some(menu) = &mut self.2 {
+        if let Some(menu) = &mut self.4 {
             menu.process(&mut self.0);
         }
         self.0.guarded(|app| app.logic(ctx));
         #[cfg(target_os = "macos")]
-        if let Some(menu) = &mut self.2 {
+        if let Some(menu) = &mut self.4 {
             menu.sync(&self.0);
         }
         // Files dropped on the window: audio on an instrument track or a Sampler window loads
@@ -72,9 +78,21 @@ impl eframe::App for App {
             self.0.ui.window_size = (r.size() * ctx.zoom_factor()).round().into();
         }
         self.0.ui.ui_scale = self.0.extra.ui_scale;
-        // Saved now rather than at exit: the recent list matters most after a crash.
-        if self.0.take_recent_changed() {
-            save_prefs(&self.0.ui);
+        // Settings are saved shortly after they change, not only at exit: a crash or kill would
+        // otherwise lose the choices made since start (the audio device, the layout, the recents).
+        if prefs_enabled() {
+            let since = self.3.elapsed();
+            if since >= PREFS_CHECK {
+                self.3 = Instant::now();
+                if let Some(path) = prefs_path()
+                    && let Err(error) = self.2.save_if_changed(&path, &self.0.ui)
+                {
+                    log::warn!("{error}");
+                }
+            } else {
+                // An idle window draws no more frames: wake for the check this frame's change needs.
+                ctx.request_repaint_after(PREFS_CHECK - since);
+            }
         }
         // With the system menu bar there is no egui bar showing the window and dirty state, so the
         // title carries them; elsewhere the egui menu bar already does.
@@ -282,6 +300,7 @@ fn main() -> eframe::Result {
             app.leftovers = app.autosave_dir.as_deref().map(soundcraft_engine::autosave::leftovers).unwrap_or_default();
             app.preset_dir = prefs_path().and_then(|p| p.parent().map(|d| d.join("Presets")));
             app.extra.ui_scale = prefs.ui_scale;
+            let saver = config::PrefsSaver::new(&prefs);
             app.ui = prefs;
             if let Some(port) = control_port {
                 let rx = control_server::start(port, cc.egui_ctx.clone());
@@ -305,6 +324,8 @@ fn main() -> eframe::Result {
             Ok(Box::new(App(
                 app,
                 logger,
+                saver,
+                Instant::now(),
                 #[cfg(target_os = "macos")]
                 menu,
             )))

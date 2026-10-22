@@ -106,13 +106,8 @@ fn read_ui(path: &std::path::Path, recover_docking: bool) -> Result<Option<sound
 
 const MAX_UI_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Write settings atomically. Preserve an unreadable or malformed existing file for recovery.
-pub fn save_ui(path: &std::path::Path, ui: &soundcraft_ui_egui::UiState) -> Result<(), String> {
-    use std::io::Write as _;
-    // Loading can recover a future layout for this session, but saving must preserve its source.
-    read_ui(path, false)?;
-    ui.docking.validate()?;
-    ui.mix_docking.validate_mix()?;
+/// The bytes `save_ui` writes: the settings without this session's transient windows and status.
+fn settings_bytes(ui: &soundcraft_ui_egui::UiState) -> Result<Vec<u8>, String> {
     let mut saved = ui.clone();
     saved.plugin_windows.clear();
     saved.status.clear();
@@ -120,6 +115,17 @@ pub fn save_ui(path: &std::path::Path, ui: &soundcraft_ui_egui::UiState) -> Resu
     if bytes.len() as u64 > MAX_UI_BYTES {
         return Err("Settings exceed the 4 MiB limit".into());
     }
+    Ok(bytes)
+}
+
+/// Write settings atomically. Preserve an unreadable or malformed existing file for recovery.
+pub fn save_ui(path: &std::path::Path, ui: &soundcraft_ui_egui::UiState) -> Result<(), String> {
+    use std::io::Write as _;
+    // Loading can recover a future layout for this session, but saving must preserve its source.
+    read_ui(path, false)?;
+    ui.docking.validate()?;
+    ui.mix_docking.validate_mix()?;
+    let bytes = settings_bytes(ui)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
@@ -136,6 +142,30 @@ pub fn save_ui(path: &std::path::Path, ui: &soundcraft_ui_egui::UiState) -> Resu
         let _ = std::fs::remove_file(&temporary);
     }
     written.map_err(|error| format!("Settings could not be saved: {error}"))
+}
+
+/// Saves settings whenever they differ from what was last written, so a crash loses at most the
+/// changes made since the last check. Remembers the bytes it compared, not the file's contents.
+pub struct PrefsSaver {
+    last: Option<Vec<u8>>,
+}
+
+impl PrefsSaver {
+    /// Seeded from the settings as loaded, so starting the app rewrites nothing.
+    pub fn new(loaded: &soundcraft_ui_egui::UiState) -> Self {
+        Self { last: settings_bytes(loaded).ok() }
+    }
+
+    /// Writes `ui` to `path` if its settings changed since the last call. Returns whether it wrote.
+    /// A state that is refused is remembered too, so its error is reported once, not on every call.
+    pub fn save_if_changed(&mut self, path: &Path, ui: &soundcraft_ui_egui::UiState) -> Result<bool, String> {
+        let bytes = settings_bytes(ui)?;
+        if self.last.as_ref() == Some(&bytes) {
+            return Ok(false);
+        }
+        self.last = Some(bytes);
+        save_ui(path, ui).map(|()| true)
+    }
 }
 
 #[cfg(test)]
@@ -209,6 +239,23 @@ mod config_tests {
                 assert_eq!(std::fs::read(&path).unwrap(), bytes);
             }
         }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_changed_setting_reaches_disk_without_exit() {
+        // Protects the crash case: a device picked in the Playback Engine must survive a kill.
+        let directory = std::env::temp_dir().join(format!("soundcraft-autosave-prefs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let path = directory.join("ui.json");
+        let mut ui = soundcraft_ui_egui::UiState::default();
+        let mut saver = PrefsSaver::new(&ui);
+        assert_eq!(saver.save_if_changed(&path, &ui), Ok(false));
+        assert!(!path.exists());
+        ui.audio.output = Some("pipewire:alsa_output.test".into());
+        assert_eq!(saver.save_if_changed(&path, &ui), Ok(true));
+        assert_eq!(load_ui(&path).unwrap().unwrap().audio.output.as_deref(), Some("pipewire:alsa_output.test"));
+        assert_eq!(saver.save_if_changed(&path, &ui), Ok(false));
         std::fs::remove_dir_all(directory).unwrap();
     }
 

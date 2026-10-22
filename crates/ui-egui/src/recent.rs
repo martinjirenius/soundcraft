@@ -1,9 +1,8 @@
 //! File › Open Recent: the sessions last opened or saved, newest first.
 //!
 //! The list lives in [`crate::UiState::recent_sessions`], so it is saved with the rest of the UI
-//! state in `ui.json`. A desktop host saves that only on a clean exit, and a list kept only until
-//! then is lost by exactly the crash that sends someone looking for their last session, so a
-//! change raises [`crate::SoundApp::recent_changed`] for the host to save it straight away.
+//! state in `ui.json`. A desktop host saves changed UI state shortly after the change, not only at
+//! exit, so the list survives the crash that sends someone looking for their last session.
 //!
 //! Entries are recorded from the engine's session path whenever it changes (open, save as), not
 //! from the commands themselves, so every way a session gets a path (menu, control channel, MCP,
@@ -59,16 +58,9 @@ impl SoundApp {
             return;
         }
         self.recent_seen.clone_from(&self.engine.path);
-        if let Some(p) = self.recent_seen.clone()
-            && note(&mut self.ui.recent_sessions, &p)
-        {
-            self.recent_changed = true;
+        if let Some(p) = self.recent_seen.clone() {
+            note(&mut self.ui.recent_sessions, &p);
         }
-    }
-
-    /// For the desktop host: whether the recent list changed since the last call (save it now).
-    pub fn take_recent_changed(&mut self) -> bool {
-        std::mem::take(&mut self.recent_changed)
     }
 
     /// Whether each recent session still exists, re-checked at most every [`EXISTS_TTL`] seconds.
@@ -103,7 +95,6 @@ pub fn menu(app: &mut SoundApp, ui: &mut egui::Ui) {
         ui.separator();
         if ui.button("Clear Recent").clicked() {
             app.ui.recent_sessions.clear();
-            app.recent_changed = true;
             ui.close();
         }
         if let Some(path) = open {

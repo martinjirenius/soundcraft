@@ -247,10 +247,8 @@ pub enum Gesture {
 
 pub struct SoundApp {
     pub engine: Engine,
-    /// The session path as of the last frame, and whether the recent list changed since the host
-    /// last saved it (see `recent`).
+    /// The session path as of the last frame (see `recent`).
     recent_seen: Option<String>,
-    recent_changed: bool,
     /// When the recent sessions were last checked for existence, which list, and the result.
     recent_checked: Option<(f64, Vec<String>, Vec<bool>)>,
     pub player: Option<Player>,
@@ -353,7 +351,6 @@ impl SoundApp {
     pub fn new(engine: Engine, player: Option<Player>, services: Services) -> Self {
         SoundApp {
             recent_seen: engine.path.clone(),
-            recent_changed: false,
             recent_checked: None,
             engine,
             player,

@@ -630,6 +630,8 @@ struct Reader {
     primed: bool,
     /// Extra frames kept in hand, grown each time the input ran dry.
     extra: usize,
+    /// Half-second windows in a row with no gap. At twenty (ten seconds) the extra is halved.
+    clean: usize,
     /// Fewest frames left after a read in the current half-second window, and its length so far.
     low: usize,
     window: usize,
@@ -650,8 +652,13 @@ pub struct InputRing {
     pub channels: AtomicUsize,
     /// Input device sample rate in Hz (0 when unknown, which reads as "same as the session").
     rate: u32,
-    /// Largest block the input callback delivered (frames).
-    push_block: AtomicUsize,
+    /// Largest block the input callback delivered in the current half-second window (frames).
+    window_block: AtomicUsize,
+    /// Largest block in the window before the current one (frames). Together with
+    /// `window_block` this is the recent largest block, read by [`InputRing::input_block`].
+    previous_block: AtomicUsize,
+    /// Frames the input callback has delivered in the current window.
+    window_frames: AtomicUsize,
     /// Times the input ran dry while being read (each is a gap in what is heard).
     underruns: AtomicUsize,
     /// The input found the ring full and dropped a block: what is buffered is stale.
@@ -690,17 +697,20 @@ impl InputRing {
             tail: AtomicUsize::new(0),
             channels: AtomicUsize::new(ch),
             rate,
-            push_block: AtomicUsize::new(0),
+            window_block: AtomicUsize::new(0),
+            previous_block: AtomicUsize::new(0),
+            window_frames: AtomicUsize::new(0),
             underruns: AtomicUsize::new(0),
             overflowed: AtomicBool::new(false),
             peaks: (0..ch.min(64)).map(|_| AtomicU32::new(0)).collect(),
-            reader: Mutex::new(Reader { phase: 0.0, primed: false, extra: 0, low: usize::MAX, window: 0, trim: 0.0, drift: 0.0 }),
+            reader: Mutex::new(Reader { phase: 0.0, primed: false, extra: 0, clean: 0, low: usize::MAX, window: 0, trim: 0.0, drift: 0.0 }),
         })
     }
 
-    /// Frames per callback the input device delivers (0 before the first).
+    /// Frames per callback the input device delivers, over the last one or two half-seconds
+    /// (0 before the first).
     pub fn input_block(&self) -> usize {
-        self.push_block.load(Ordering::Relaxed)
+        self.previous_block.load(Ordering::Relaxed).max(self.window_block.load(Ordering::Relaxed))
     }
 
     /// The peak level of each input channel since the last call (linear, 1.0 is full scale).
@@ -728,7 +738,17 @@ impl InputRing {
             }
         }
         self.head.store(head.wrapping_add(samples.len()), Ordering::Release);
-        self.push_block.fetch_max(samples.len() / ch, Ordering::Relaxed);
+        // Windows of half a second of input: a callback size that is gone drops out after two.
+        let block = samples.len() / ch;
+        let window = if self.rate == 0 { 24_000 } else { (self.rate as usize / 2).max(1) };
+        self.window_block.fetch_max(block, Ordering::Relaxed);
+        let counted = self.window_frames.load(Ordering::Relaxed).saturating_add(block);
+        if counted >= window {
+            self.previous_block.store(self.window_block.swap(0, Ordering::Relaxed), Ordering::Relaxed);
+            self.window_frames.store(0, Ordering::Relaxed);
+        } else {
+            self.window_frames.store(counted, Ordering::Relaxed);
+        }
         // Levels for the input meters. Non-negative floats order like their bits.
         for (c, peak) in self.peaks.iter().enumerate() {
             let top = samples.iter().skip(c).step_by(ch).fold(0.0f32, |m, s| m.max(finite(*s).abs()));
@@ -763,7 +783,10 @@ impl InputRing {
         // What this read takes, the input's own block, and the reserve beyond the read: a callback
         // of the longer side and a little more, so that a late input block is not a gap.
         let need = (frames as f64 * ratio).ceil() as usize + 2;
-        let push = self.push_block.load(Ordering::Relaxed).max(1);
+        let push = self.input_block().max(1);
+        // The extra kept in hand is capped by the current callbacks, so it shrinks with them.
+        let cap = push.saturating_mul(4).max(256);
+        r.extra = r.extra.min(cap);
         // No more than the ring can hold, so that a ring filled by fresh input starts reading.
         let room = self.slots.len() / ch;
         let reserve = need.max(push + 2).saturating_add(16).saturating_add(r.extra).min(room.saturating_sub(need));
@@ -785,7 +808,7 @@ impl InputRing {
             let keep = start.saturating_add(push).min(avail);
             tail = head.wrapping_sub(keep * ch);
             avail = keep;
-            *r = Reader { primed: true, extra: r.extra, phase: 0.0, low: usize::MAX, window: 0, trim: r.drift, drift: r.drift };
+            *r = Reader { primed: true, extra: r.extra, clean: r.clean, phase: 0.0, low: usize::MAX, window: 0, trim: r.drift, drift: r.drift };
         }
         let step = ratio * (1.0 + r.trim);
         for f in 0..frames {
@@ -798,7 +821,8 @@ impl InputRing {
             if r.phase >= 1.0 || avail < 2 {
                 // Ran dry: a gap. Keep more in hand from now on (up to four input blocks more).
                 r.primed = false;
-                r.extra = r.extra.saturating_add(reserve / 2 + 1).min(push.saturating_mul(4).max(256));
+                r.extra = r.extra.saturating_add(reserve / 2 + 1).min(cap);
+                r.clean = 0;
                 self.underruns.fetch_add(1, Ordering::Relaxed);
                 break;
             }
@@ -817,6 +841,13 @@ impl InputRing {
             r.window = r.window.saturating_add(frames);
             let window = (session_rate as usize / 2).max(1);
             if r.window >= window {
+                // A gap at a buffer-size switch must not leave its extra in hand forever: after ten
+                // clean seconds, half of it goes.
+                r.clean = r.clean.saturating_add(1);
+                if r.clean >= 20 {
+                    r.extra /= 2;
+                    r.clean = 0;
+                }
                 let over = r.low as f64 - reserve as f64;
                 if over > (push.max(need) + self.rate.max(1) as usize / 100) as f64 {
                     // Far behind (more than 10 ms late): drop the excess at once.
@@ -906,6 +937,38 @@ mod ring_tests {
         // 64 + 2 to read, that and 16 more in reserve, 64 for the next input block.
         assert_eq!(out[0][0], (20_000 - 212) as f32);
         assert_eq!(out[0][63], (20_000 - 212 + 63) as f32);
+    }
+
+    /// Measured 2026-10-23: monitoring stayed about 20 ms late after the buffer size dropped from
+    /// 1024 to 64 frames, because the reserve remembered the largest callback ever seen. A gap at
+    /// the switch (one missed push) is covered too: the extra it grows must decay after a while.
+    #[test]
+    fn the_reserve_shrinks_when_the_callbacks_do() {
+        // Pushes and reads `count` blocks of `block` frames of a ramp that counts its frames; the
+        // pushes numbered in `skip` are left out. Returns the delay held back: frames pushed minus
+        // the last frame played.
+        fn play(ring: &InputRing, pushed: &mut usize, block: usize, count: usize, skip: std::ops::Range<usize>) -> f64 {
+            let mut out = vec![vec![0.0f32; block]];
+            for i in 0..count {
+                if !skip.contains(&i) {
+                    let ramp: Vec<f32> = (*pushed..*pushed + block).map(|k| k as f32).collect();
+                    ring.push(&ramp);
+                    *pushed += block;
+                }
+                ring.pop_into(&mut out, block, 48_000);
+            }
+            *pushed as f64 - f64::from(out[0].last().copied().unwrap_or(0.0))
+        }
+        // Two seconds of 1024-frame callbacks, three of them missing so the reader runs dry; then
+        // forty seconds of 64-frame ones. A fresh ring only does the 64-frame part.
+        let switched = InputRing::new(1, 48_000);
+        let mut pushed = 0;
+        play(&switched, &mut pushed, 1024, 94, 50..53);
+        assert!(switched.underruns() > 0, "the phase before the switch leaves a gap");
+        let delay = play(&switched, &mut pushed, 64, 30_000, 0..0);
+        let mut fresh_pushed = 0;
+        let fresh = play(&InputRing::new(1, 48_000), &mut fresh_pushed, 64, 30_000, 0..0);
+        assert!((delay - fresh).abs() <= 64.0, "switched {delay} frames late, fresh {fresh}");
     }
 
     #[test]

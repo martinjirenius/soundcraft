@@ -10,6 +10,7 @@ use egui::{Align2, Color32, CornerRadius, Rect, Sense, Stroke, StrokeKind, Ui, p
 use serde_json::json;
 use soundcraft_model::{ChannelFormat, Route, SurroundPan, Track, TrackId, TrackKind};
 use soundcraft_playback::MeterSnapshot;
+use std::collections::HashMap;
 
 pub fn strip_width(narrow: bool) -> f32 {
     if narrow { 64.0 } else { 98.0 }
@@ -727,13 +728,14 @@ fn run_pick(app: &mut SoundApp, ui: &Ui, cmd: &str, params: serde_json::Value) {
 
 /// The plugins whose name or vendor holds the search text: the built-in ones, then Audio Units
 /// (listing them creates no instances) and whichever of CLAP and VST3 have been scanned, with a
-/// button to scan each of the others. Returns the id picked.
+/// button to scan each of the others. Each plugin is listed once, in its preferred format (CLAP,
+/// then VST3, then AU); the format submenus still list every format. Returns the id picked.
 fn plugin_search(ui: &mut Ui, search: &MenuSearch, instruments: bool) -> Option<String> {
     let mut built_in: Vec<&soundcraft_dsp::PluginInfo> =
         soundcraft_dsp::plugins().iter().copied().filter(|p| p.is_instrument == instruments && search.matches(p.name)).collect();
     built_in.sort_by_cached_key(|p| p.name.to_lowercase());
     let (clap, vst3) = (soundcraft_clap_host::cached(), soundcraft_vst3_host::cached());
-    let mut hosted: Vec<(MenuPlugin, &str)> = Vec::new();
+    let mut hosted: Vec<(MenuPlugin, &'static str)> = Vec::new();
     for d in clap.iter().flatten().filter(|d| d.is_instrument == instruments) {
         hosted.push((MenuPlugin { id: d.id.clone(), name: d.name.clone(), vendor: d.vendor.clone() }, "CLAP"));
     }
@@ -744,13 +746,15 @@ fn plugin_search(ui: &mut Ui, search: &MenuSearch, instruments: bool) -> Option<
         hosted.push((MenuPlugin { id: d.id, name: d.name, vendor: d.vendor }, "AU"));
     }
     hosted.retain(|(p, _)| search.matches(&p.name) || search.matches(&p.vendor));
+    let mut hosted = preferred_formats(hosted);
     hosted.sort_by_cached_key(|(p, format)| (p.name.to_lowercase(), *format));
     let n = built_in.len() + hosted.len();
     let picked = search.rows(ui, n, 320.0, |ui, i, highlighted| match built_in.get(i) {
         Some(p) => menu_row(ui, highlighted, p.name),
         None => {
             let (p, format) = &hosted[i - built_in.len()];
-            let label = if p.vendor.is_empty() { format!("{} ({format})", p.name) } else { format!("{} — {} ({format})", p.name, p.vendor) };
+            let vendor = shown_vendor(&p.vendor);
+            let label = if vendor.is_empty() { format!("{} ({format})", p.name) } else { format!("{} — {vendor} ({format})", p.name) };
             menu_row(ui, highlighted, &label)
         }
     });
@@ -849,6 +853,46 @@ struct MenuPlugin {
     id: String,
     name: String,
     vendor: String,
+}
+
+/// Keeps, for each plugin, only the entries in its most preferred format (CLAP, then VST3, then AU),
+/// since the same plugin is installed in each format. Entries of one format are never collapsed, so
+/// two distinct plugins with equal keys both stay. Formats are told apart by match key.
+fn preferred_formats(hosted: Vec<(MenuPlugin, &'static str)>) -> Vec<(MenuPlugin, &'static str)> {
+    let mut best: HashMap<(String, String), usize> = HashMap::new();
+    for (p, format) in &hosted {
+        let rank = format_rank(format);
+        best.entry(match_key(p)).and_modify(|kept| *kept = (*kept).min(rank)).or_insert(rank);
+    }
+    hosted.into_iter().filter(|(p, format)| best.get(&match_key(p)) == Some(&format_rank(format))).collect()
+}
+
+/// The format words a vendor may carry, such as LSP's "LSP CLAP" and "LSP VST3".
+const FORMAT_WORDS: [&str; 6] = ["clap", "vst3", "vst", "vst2", "lv2", "au"];
+
+/// Two entries are the same plugin when their keys are equal. Vendors such as LSP name the format
+/// in the vendor ("LSP CLAP", "LSP VST3"), so format words are dropped from the vendor only.
+fn match_key(p: &MenuPlugin) -> (String, String) {
+    let vendor: String =
+        p.vendor.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty() && !FORMAT_WORDS.contains(word)).collect();
+    let name: String = p.name.to_lowercase().split(|c: char| !c.is_alphanumeric()).collect();
+    (vendor, name)
+}
+
+/// The vendor as a row shows it, without the format words: vendors such as LSP name the format, and
+/// the row already shows it.
+fn shown_vendor(vendor: &str) -> String {
+    vendor.split_whitespace().filter(|word| !FORMAT_WORDS.contains(&word.to_lowercase().as_str())).collect::<Vec<_>>().join(" ")
+}
+
+/// The rank of a format in `preferred_formats`: lower is preferred, and unknown formats rank last.
+fn format_rank(format: &str) -> usize {
+    match format {
+        "CLAP" => 0,
+        "VST3" => 1,
+        "AU" => 2,
+        _ => 3,
+    }
 }
 
 /// The CLAP, VST3 and (on macOS) Audio Units submenus, of effects or of instruments; returns the
@@ -1319,8 +1363,72 @@ fn route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, input: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{dragged_send_db, editable_readout, input_choices, parse_db, parse_pan};
+    use super::{MenuPlugin, dragged_send_db, editable_readout, input_choices, parse_db, parse_pan, preferred_formats, shown_vendor};
     use egui::{Event, Modifiers, PointerButton, Rect, pos2, vec2};
+
+    fn hosted(name: &str, vendor: &str, format: &'static str) -> (MenuPlugin, &'static str) {
+        (MenuPlugin { id: format!("{format}:{name}"), name: name.into(), vendor: vendor.into() }, format)
+    }
+
+    #[test]
+    fn a_plugin_in_several_formats_is_listed_once_in_the_preferred_one() {
+        let kept = preferred_formats(vec![hosted("Surge XT", "Surge Synth Team", "AU"), hosted("Surge XT", "Surge Synth Team", "VST3")]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].1, "VST3");
+
+        let kept = preferred_formats(vec![hosted("Surge XT", "Surge Synth Team", "VST3"), hosted("Surge XT", "Surge Synth Team", "CLAP")]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].1, "CLAP");
+
+        let kept = preferred_formats(vec![hosted("Odd", "Vendor", "LV2"), hosted("Odd", "Vendor", "AU")]);
+        assert_eq!(kept[0].1, "AU");
+    }
+
+    #[test]
+    fn vendors_that_name_the_format_still_match() {
+        let kept = preferred_formats(vec![hosted("LSP Compressor", "LSP CLAP", "CLAP"), hosted("LSP Compressor", "LSP VST3", "VST3")]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].1, "CLAP");
+    }
+
+    #[test]
+    fn different_plugins_from_one_vendor_all_survive() {
+        let kept = preferred_formats(vec![
+            hosted("Surge XT", "Surge Synth Team", "CLAP"),
+            hosted("Surge XT", "Surge Synth Team", "VST3"),
+            hosted("Surge Pad", "Surge Synth Team", "CLAP"),
+        ]);
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn distinct_plugins_in_the_preferred_format_all_survive() {
+        let clap = |id: &str| (MenuPlugin { id: id.into(), name: "Comp".into(), vendor: "A".into() }, "CLAP");
+        let kept = preferred_formats(vec![clap("comp-1"), clap("comp-2"), hosted("Comp", "A", "VST3")]);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().all(|(_, format)| *format == "CLAP"));
+    }
+
+    #[test]
+    fn row_vendors_drop_the_format_words_the_row_already_shows() {
+        assert_eq!(shown_vendor("LSP CLAP"), "LSP");
+        assert_eq!(shown_vendor("LSP VST3"), "LSP");
+        assert_eq!(shown_vendor("Surge Synth Team"), "Surge Synth Team");
+        assert_eq!(shown_vendor("CLAP"), "");
+    }
+
+    #[test]
+    fn the_same_name_from_different_vendors_survives() {
+        let kept = preferred_formats(vec![hosted("Comp", "A", "CLAP"), hosted("Comp", "B", "CLAP")]);
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn names_match_regardless_of_case_and_punctuation() {
+        let kept = preferred_formats(vec![hosted("A/B Tester x2 Mono", "Vendor", "CLAP"), hosted("A-B Tester X2 mono", "Vendor", "VST3")]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].1, "CLAP");
+    }
 
     #[test]
     fn input_choices_offer_whole_blocks_of_the_track_width() {

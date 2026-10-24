@@ -16,6 +16,12 @@ log.workspace = true
 # The LV2 host library (MIT) over the system lilv (`liblilv-0`). Native only.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 livi.workspace = true
+libloading = "0.8"
+lv2_raw = "0.3"
+
+# The Linux/BSD host window for LV2 X11 UIs (a plugin's own editor parents into it).
+[target.'cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))'.dependencies]
+soundcraft-x11-window.workspace = true
 
 # The isolated unsafe helper crate (craftrules never-crash): this crate opts out of the workspace
 # `unsafe_code = "forbid"` for itself only. It denies unsafe everywhere and allows it solely on the

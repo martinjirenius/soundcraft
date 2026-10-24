@@ -1,9 +1,10 @@
 //! The LV2 parameters of a plugin, read with lilv through livi (native only): one `ParamInfo`
 //! per control input port, and the port map that drives them.
 
-use crate::scan::{ParamPort, PortMap};
+use crate::scan::{ParamPort, PortMap, UiInfo};
 use livi::World;
 use soundcraft_dsp::{FileParamInfo, ParamInfo, Taper, Unit};
+use std::ffi::CString;
 
 /// Most labels read for an enumeration parameter (as in the CLAP host).
 const MAX_CHOICES: usize = 128;
@@ -25,6 +26,7 @@ const PATCH_WRITABLE: &str = "http://lv2plug.in/ns/ext/patch#writable";
 const PATCH_MESSAGE: &str = "http://lv2plug.in/ns/ext/patch#Message";
 const RDFS_RANGE: &str = "http://www.w3.org/2000/01/rdf-schema#range";
 const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
+const LV2_X11_UI: &str = "http://lv2plug.in/ns/extensions/ui#X11UI";
 
 /// A lilv number as a finite `f32` (floats and integers; anything else is `None`).
 fn node_f32(n: Option<&livi::lilv::node::Node>) -> Option<f32> {
@@ -169,8 +171,20 @@ pub(crate) fn files(plugin: &livi::Plugin, world: &World, map: &mut PortMap) -> 
     files
 }
 
+/// The plugin's X11 UI (its first `ui:X11UI`), with the binary and bundle paths. None when it has
+/// no X11 UI, or a piece of its path cannot be read (a UI this host cannot load is not offered).
+pub(crate) fn x11_ui(plugin: &livi::Plugin, world: &World) -> Option<UiInfo> {
+    let x11 = world.raw().new_uri(LV2_X11_UI);
+    let ui = plugin.raw().uis()?.iter().find(|ui| ui.is_a(&x11))?;
+    let uri = ui.uri().as_uri()?.to_string();
+    let binary = ui.binary_uri()?.path()?.1;
+    let bundle = ui.bundle_uri()?.path()?.1;
+    let bundle = if bundle.ends_with('/') { bundle } else { format!("{bundle}/") };
+    Some(UiInfo { uri: CString::new(uri).ok()?, binary: binary.into(), bundle: CString::new(bundle).ok()? })
+}
+
 /// Index of the scale value closest to `value` (0 when there is none).
-fn nearest_index(scale: &[f32], value: f32) -> f32 {
+pub(crate) fn nearest_index(scale: &[f32], value: f32) -> f32 {
     let mut best = (0usize, f32::INFINITY);
     for (i, s) in scale.iter().enumerate() {
         let d = (s - value).abs();

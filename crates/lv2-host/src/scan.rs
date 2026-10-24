@@ -3,6 +3,7 @@
 //! parameters lives in `meta` (native only).
 
 use soundcraft_dsp::Category;
+use std::ffi::CString;
 use std::path::PathBuf;
 
 /// One parameter of a plugin: the control input port it drives and, for an enumeration, the
@@ -11,6 +12,18 @@ use std::path::PathBuf;
 pub(crate) struct ParamPort {
     pub port: usize,
     pub scale: Vec<f32>,
+}
+
+/// A plugin's X11 UI (`ui:X11UI`): the UI binary, the URI that names the UI in the binary, and the
+/// bundle folder the UI loads its resources from.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct UiInfo {
+    /// The UI's URI (what its descriptor is matched by in the binary).
+    pub uri: CString,
+    /// The shared library that holds the UI's `lv2ui_descriptor`.
+    pub binary: PathBuf,
+    /// The UI bundle folder, with a trailing `/` (as LV2 passes it to the UI).
+    pub bundle: CString,
 }
 
 /// Which control ports drive which parameter, and the designated ports the host sets itself.
@@ -27,6 +40,8 @@ pub(crate) struct PortMap {
     /// The atom input that takes `patch:Message` (file parameters are delivered to it), as its
     /// ordinal among the plugin's atom inputs (the order `livi` connects them in).
     pub patch_input: Option<usize>,
+    /// The plugin's X11 UI, when it has one (its editor can be hosted in a SoundCraft window).
+    pub ui: Option<UiInfo>,
 }
 
 /// SoundCraft's insert category for a plugin with these LV2 classes (labels, parents included).

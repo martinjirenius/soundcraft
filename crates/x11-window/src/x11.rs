@@ -121,6 +121,16 @@ impl X11Window {
         let _ = self.conn.flush();
     }
 
+    /// The size of a child window (its geometry), or None when it cannot be read (no such window,
+    /// a closed connection, or no reply). One round trip to the server.
+    pub fn child_size(&self, child: u32) -> Option<(u32, u32)> {
+        if self.closed.get() || child == 0 {
+            return None;
+        }
+        let reply = self.conn.get_geometry(child).ok()?.reply().ok()?;
+        Some((u32::from(reply.width), u32::from(reply.height)))
+    }
+
     /// Destroys the window and closes the connection.
     pub fn close(self) {
         let _ = self.conn.destroy_window(self.win);

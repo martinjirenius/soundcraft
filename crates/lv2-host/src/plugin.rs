@@ -12,12 +12,17 @@
 //! Scratch buffers, atom sequences and the feature set are made in `prepare`; `process` makes no
 //! allocation. Blocks longer than the prepared maximum are run in pieces.
 
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+use crate::editor::Lv2Editor;
 use crate::ffi::{self, free_instances};
 use crate::registry;
 use crate::scan::{ParamPort, PortMap};
 use livi::event::{LV2AtomEventBuilder, LV2AtomSequence};
-use livi::{Features, Instance, PortIndex, WorkerManager};
-use soundcraft_dsp::{Plugin, PluginInfo, PluginService, ServiceReport};
+use livi::{Features, Instance, PortIndex};
+use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, PluginService, ServiceReport};
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+use std::ffi::CString;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// Largest block we prepare for.
@@ -222,8 +227,12 @@ pub struct Lv2Plugin {
     /// buffers alone until a successful `prepare`.
     failed: bool,
     latency: usize,
-    /// The worker manager of the current feature set, for the main-thread service.
-    workers: Arc<Mutex<Option<Arc<WorkerManager>>>>,
+    /// The feature set of the last successful prepare (its worker manager runs in the service, and
+    /// its URID map and options go to a UI). Empty until the first prepare succeeds.
+    features: Arc<Mutex<Option<Arc<Features>>>>,
+    /// The current parameter values as f32 bits, parallel to `info.params`, for the editor's
+    /// reads (written with `Relaxed` atomics by `set_param`, never locked).
+    values_shared: Arc<[AtomicU32]>,
     /// URIDs of the current feature set (zero before the first `prepare`).
     patch: PatchUrids,
     /// One slot per `info.files` entry, in order.
@@ -248,7 +257,8 @@ impl Lv2Plugin {
             prepared: None,
             failed: false,
             latency: 0,
-            workers: Arc::new(Mutex::new(None)),
+            features: Arc::new(Mutex::new(None)),
+            values_shared: info.params.iter().map(|p| AtomicU32::new(p.default.to_bits())).collect::<Vec<_>>().into(),
             patch: PatchUrids::default(),
             files: Vec::new(),
         }
@@ -267,7 +277,7 @@ impl Drop for Lv2Plugin {
 
 /// The value the plugin's control port takes for a SoundCraft value (an enumeration index maps to
 /// its scale point).
-fn plugin_value(pp: &ParamPort, v: f32) -> f32 {
+pub(crate) fn plugin_value(pp: &ParamPort, v: f32) -> f32 {
     if pp.scale.is_empty() {
         return v;
     }
@@ -349,7 +359,7 @@ impl Plugin for Lv2Plugin {
             }
             self.latency = latency_of(&lane.inst, self.map);
         }
-        *self.workers.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(features.worker_manager()));
+        *self.features.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&features));
         self.lanes = lanes;
         self.failed = false;
     }
@@ -364,6 +374,9 @@ impl Plugin for Lv2Plugin {
         let v = pi.clamp(value);
         if let Some(slot) = self.values.get_mut(i) {
             *slot = v;
+        }
+        if let Some(shared) = self.values_shared.get(i) {
+            shared.store(v.to_bits(), Ordering::Relaxed);
         }
         if let Some(pp) = self.map.params.get(i) {
             for lane in &mut self.lanes {
@@ -501,22 +514,36 @@ impl Plugin for Lv2Plugin {
         Err("LV2 editors are not hosted yet".to_string())
     }
 
+    /// The plugin's X11 UI as an editor (a SoundCraft X11 window). None when the plugin has no X11
+    /// UI, or on a platform without X11.
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+    fn editor(&mut self) -> Option<Box<dyn PluginEditor>> {
+        self.map.ui.as_ref()?;
+        let plugin_uri = CString::new(crate::parse_id(self.info.id)?).ok()?;
+        Some(Box::new(Lv2Editor::new(self.info, self.map, Arc::clone(&self.values_shared), Arc::clone(&self.features), plugin_uri)))
+    }
+
+    #[cfg(not(all(unix, not(target_os = "macos"), not(target_os = "android"))))]
+    fn editor(&mut self) -> Option<Box<dyn PluginEditor>> {
+        None
+    }
+
     fn service_handle(&mut self) -> Option<Box<dyn PluginService>> {
-        Some(Box::new(Lv2Service { workers: Arc::clone(&self.workers) }))
+        Some(Box::new(Lv2Service { features: Arc::clone(&self.features) }))
     }
 }
 
 /// The main-thread service point of a hosted LV2 plugin: runs the workers the plugin scheduled
 /// (see [`PluginService`]).
 struct Lv2Service {
-    workers: Arc<Mutex<Option<Arc<WorkerManager>>>>,
+    features: Arc<Mutex<Option<Arc<Features>>>>,
 }
 
 impl PluginService for Lv2Service {
     fn service(&mut self) -> ServiceReport {
-        let manager = self.workers.lock().unwrap_or_else(PoisonError::into_inner).clone();
-        if let Some(m) = manager {
-            m.run_workers();
+        let features = self.features.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        if let Some(f) = features {
+            f.worker_manager().run_workers();
         }
         ServiceReport { values_changed: false, dirty: false }
     }

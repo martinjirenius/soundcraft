@@ -142,6 +142,7 @@ fn describe(id: &str) -> Result<(livi::Plugin, &'static PluginInfo, &'static Por
         audiosuite: false,
         files: Box::leak(files.into_boxed_slice()),
     }));
+    map.ui = meta::x11_ui(&plugin, world);
     let map: &'static PortMap = Box::leak(Box::new(map));
     infos.insert(id.to_string(), (info, map));
     Ok((plugin, info, map))

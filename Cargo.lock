@@ -3913,10 +3913,13 @@ dependencies = [
 name = "soundcraft-lv2-host"
 version = "0.10.0"
 dependencies = [
+ "libloading 0.8.9",
  "livi",
  "log",
+ "lv2_raw",
  "serde",
  "soundcraft-dsp",
+ "soundcraft-x11-window",
  "thiserror 2.0.21",
 ]
 

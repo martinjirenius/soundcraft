@@ -12,7 +12,9 @@
 //! we cannot change. A plugin that crashes takes the process with it: native code is not sandboxed.
 //!
 //! What is hosted: audio effects with audio inputs and outputs (mono, stereo, or the channel
-//! rules in `plugin.rs`). Not yet: editors (the generic parameter editor works), LV2 state
+//! rules in `plugin.rs`). Editors: a plugin's X11 UI opens in a SoundCraft X11 window (`editor`);
+//! other UIs (GTK, Qt) are not hosted, and the generic parameter editor stands in for them. Not
+//! yet: LV2 state
 //! extensions (SoundCraft stores the control values itself), MIDI and other atom events,
 //! CV ports, and instruments beyond what the mixer already sends.
 //!
@@ -28,6 +30,8 @@
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub mod scan;
 
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+mod editor;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(unsafe_code)]
 mod ffi;

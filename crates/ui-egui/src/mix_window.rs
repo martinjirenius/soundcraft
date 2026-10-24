@@ -1255,6 +1255,20 @@ fn send_route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, cu
     }
 }
 
+/// The input choices a track `width` channels wide gets on an interface with `count` inputs:
+/// whole blocks of `width` channels from 1 (`In 1`, `In 2`… for mono; `In 1-2`, `In 3-4`… for
+/// wider). A track wider than the interface still gets its one block: the mixer wraps it.
+fn input_choices(count: usize, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let blocks = if count < width { 1 } else { count / width };
+    (0..blocks)
+        .map(|b| {
+            let first = b.saturating_mul(width).saturating_add(1);
+            if width == 1 { format!("In {first}") } else { format!("In {first}-{}", first.saturating_add(width - 1)) }
+        })
+        .collect()
+}
+
 fn route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, input: bool) {
     let key = if input { "input" } else { "output" };
     let cmd = if input { "track.input" } else { "track.output" };
@@ -1268,9 +1282,18 @@ fn route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, input: bool) {
         ui.close();
     }
     if input {
-        for i in 1..=8 {
-            if ui.button(format!("In {i}")).clicked() {
-                let _ = app.run(cmd, json!({"track": id.0, key: format!("In {i}")}));
+        let count = crate::windows::input_channel_count(app, ui.ctx()).unwrap_or(8);
+        let width = app.engine.session().track(id).map_or(1, |t| t.channels());
+        let choices = input_choices(count, width);
+        // A stored input the interface no longer offers stays visible, so it can be seen and changed.
+        if let Some(Route::Hardware(h)) = app.engine.session().track(id).map(|t| t.mixer.input.clone())
+            && !choices.contains(&h)
+        {
+            let _ = ui.add_enabled(false, egui::Button::new(format!("{h} (unavailable)")));
+        }
+        for name in choices {
+            if ui.button(name.as_str()).clicked() {
+                let _ = app.run(cmd, json!({"track": id.0, key: name}));
                 ui.close();
             }
         }
@@ -1296,8 +1319,20 @@ fn route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, input: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{dragged_send_db, editable_readout, parse_db, parse_pan};
+    use super::{dragged_send_db, editable_readout, input_choices, parse_db, parse_pan};
     use egui::{Event, Modifiers, PointerButton, Rect, pos2, vec2};
+
+    #[test]
+    fn input_choices_offer_whole_blocks_of_the_track_width() {
+        assert_eq!(input_choices(2, 1), ["In 1", "In 2"]);
+        assert_eq!(input_choices(2, 2), ["In 1-2"]);
+        assert_eq!(input_choices(8, 2), ["In 1-2", "In 3-4", "In 5-6", "In 7-8"]);
+        assert_eq!(input_choices(5, 2), ["In 1-2", "In 3-4"]);
+        assert_eq!(input_choices(1, 2), ["In 1-2"]);
+        assert_eq!(input_choices(0, 1), ["In 1"]);
+        assert_eq!(input_choices(4, 0), ["In 1", "In 2", "In 3", "In 4"]);
+        assert_eq!(input_choices(12, 6), ["In 1-6", "In 7-12"]);
+    }
 
     #[test]
     fn typed_db_accepts_console_notation_and_clamps() {

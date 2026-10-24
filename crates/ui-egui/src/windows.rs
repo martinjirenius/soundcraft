@@ -436,6 +436,20 @@ fn chosen_device<'a>(devices: &'a [DeviceInfo], id: Option<&str>) -> Option<&'a 
     id.and_then(|n| devices.iter().find(|d| d.id == n)).or_else(|| devices.iter().find(|d| d.is_default))
 }
 
+/// How many input channels the audio interface offers: the open recorder's (what the device
+/// actually runs at), else the chosen input device's most channels. `None` when neither is known.
+pub(crate) fn input_channel_count(app: &SoundApp, ctx: &egui::Context) -> Option<usize> {
+    if let Some(r) = &app.recorder
+        && r.channels > 0
+    {
+        return Some(r.channels);
+    }
+    let systems = audio_systems(ctx, false);
+    let sys = chosen_system(&systems, &app.ui.audio)?;
+    let device = chosen_device(&sys.inputs, app.ui.audio.input.as_deref())?;
+    (device.max_channels > 0).then_some(usize::from(device.max_channels))
+}
+
 /// `show_monitors`: whether the monitors of outputs are offered (an input list hides them by
 /// default). The chosen device is always offered, so a choice never disappears from the list.
 fn device_combo(ui: &mut egui::Ui, id: &str, value: &mut Option<String>, devices: &[DeviceInfo], show_monitors: bool) {

@@ -504,8 +504,8 @@ pub(crate) fn instrument_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, r:
         None => empty_slot(ui.painter(), r, resp.hovered(), Mark::Dot),
     }
     let hosted = ins.is_some_and(|i| soundcraft_mix::is_third_party(&i.plugin));
-    if resp.clicked() && hosted && !app.ui.plugin_windows.contains(&(id, slot)) {
-        app.ui.plugin_windows.push((id, slot));
+    if resp.clicked() && hosted {
+        app.open_plugin(id, slot);
     }
     let menu_resp = if hosted { resp.clone().on_hover_text("Click: open instrument · right-click: change") } else { resp.clone() };
     let popup = if hosted { egui::Popup::context_menu(&menu_resp) } else { egui::Popup::menu(&menu_resp) };
@@ -603,8 +603,8 @@ pub(crate) fn insert_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: 
     if resp.clicked() && ins.is_some() {
         if ui.input(|i| i.modifiers.command) {
             let _ = app.run("mix.insert_bypass", json!({"track": id.0, "slot": slot}));
-        } else if !app.ui.plugin_windows.contains(&(id, slot)) {
-            app.ui.plugin_windows.push((id, slot));
+        } else {
+            app.open_plugin(id, slot);
         }
     }
     let cmd = if ui.ctx().os().is_mac() { "⌘" } else { "Ctrl+" };
@@ -626,6 +626,12 @@ pub fn plugin_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, oc
         return;
     }
     if occupied {
+        if ui.button("Edit Parameters…").clicked() {
+            if !app.ui.plugin_windows.contains(&(id, slot)) {
+                app.ui.plugin_windows.push((id, slot));
+            }
+            ui.close();
+        }
         if ui.button("Bypass").clicked() {
             run_pick(app, ui, "mix.insert_bypass", json!({"track": id.0, "slot": slot}));
         }

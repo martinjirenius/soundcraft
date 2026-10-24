@@ -641,11 +641,24 @@ impl SoundApp {
         }
     }
 
-    /// Opens the insert or instrument just picked from its menu: a hosted plugin's own editor, else (a built-in
-    /// plugin, no audio engine, or an editor that can't open here) an insert's plugin window. An
-    /// instrument only ever opens its own editor: a built-in one is played, not edited, on pick.
+    /// Opens the insert or instrument just picked from its menu. A built-in instrument is played, not edited, on
+    /// pick, so only a hosted instrument opens (its own editor, via `open_plugin`).
     fn open_inserted(&mut self) {
         let Some((track, slot)) = self.pending_open.take() else { return };
+        if slot == soundcraft_mix::INSTRUMENT_SLOT {
+            let hosted =
+                self.engine.session().track(track).and_then(|t| t.instrument.as_ref()).is_some_and(|i| soundcraft_mix::is_third_party(&i.plugin));
+            if !hosted {
+                return;
+            }
+        }
+        self.open_plugin(track, slot);
+    }
+
+    /// Opens an insert's or instrument's plugin: a hosted plugin's own editor (raised when it is already open), else
+    /// (a built-in plugin, no audio engine, or an editor that can't open here, whose reason goes to the status line)
+    /// its plugin window.
+    pub(crate) fn open_plugin(&mut self, track: TrackId, slot: usize) {
         let Some(plugin) = self
             .engine
             .session()
@@ -664,7 +677,7 @@ impl SoundApp {
                 Err(e) => self.ui.status = format!("{}: {e}", mix_window::plugin_info(&plugin).map_or(plugin.as_str(), |i| i.name)),
             }
         }
-        if slot != soundcraft_mix::INSTRUMENT_SLOT && !self.ui.plugin_windows.contains(&(track, slot)) {
+        if !self.ui.plugin_windows.contains(&(track, slot)) {
             self.ui.plugin_windows.push((track, slot));
         }
     }

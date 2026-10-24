@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, TryLockError, mpsc};
 use std::time::Duration;
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+use vst3::Steinberg::Linux::{IEventHandlerTrait, IRunLoopTrait, ITimerHandlerTrait};
 use vst3::Steinberg::Vst::{self as sv};
 use vst3::Steinberg::Vst::{
     IAttributeListTrait, IAudioProcessorTrait, IComponentHandler2Trait, IComponentHandlerTrait, IComponentTrait, IConnectionPointTrait,
@@ -1928,14 +1930,188 @@ fn split_state(data: &[u8]) -> Option<(&[u8], &[u8])> {
 
 // ---- editor (IPlugView) --------------------------------------------------------------------
 
-/// The `IPlugFrame` handed to a plugin view: `resizeView` resizes our host window.
+/// The `IPlugFrame` handed to a plugin view: `resizeView` resizes our host window. On Linux it is
+/// also the plugin's `Linux::IRunLoop` (its fd and timer registrations, see [`RunLoop`]).
 pub(crate) struct PlugFrame {
     /// The host window (an `NSWindow*` on macOS), not owned; null when there is none.
     window: std::sync::atomic::AtomicPtr<c_void>,
+    /// What the plugin registered through `IRunLoop` (Linux only).
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+    run_loop: RunLoop,
+}
+
+/// The most event handlers, and the most timers, one plugin may register on the run loop.
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+const RUN_LOOP_CAP: usize = 64;
+
+/// An `IEventHandler` and the fd it was registered for.
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+type FdWatch = (ComPtr<sb::Linux::IEventHandler>, c_int);
+
+/// An `ITimerHandler` with its period and the next time it is due.
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+struct RunLoopTimer {
+    handler: ComPtr<sb::Linux::ITimerHandler>,
+    period: Duration,
+    due: std::time::Instant,
+}
+
+/// The plugin's run-loop registrations (JUCE plugins need them for their X11 display fd and
+/// their timers). It has its own mutexes, never the editor link's: a callback may register or
+/// unregister while the host calls it, so the lists are copied out before any call is made.
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+#[derive(Default)]
+struct RunLoop {
+    handlers: Mutex<Vec<FdWatch>>,
+    timers: Mutex<Vec<RunLoopTimer>>,
+}
+
+impl PlugFrame {
+    pub(crate) fn new(window: *mut c_void) -> PlugFrame {
+        PlugFrame {
+            window: std::sync::atomic::AtomicPtr::new(window),
+            #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+            run_loop: RunLoop::default(),
+        }
+    }
+
+    /// Drops the plugin's run-loop handlers and timers (and the references they hold). The
+    /// lists are taken out under their mutexes and dropped after the locks are released.
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+    pub(crate) fn clear_run_loop(&self) {
+        let handlers = std::mem::take(&mut *self.run_loop.handlers.lock().unwrap_or_else(PoisonError::into_inner));
+        let timers = std::mem::take(&mut *self.run_loop.timers.lock().unwrap_or_else(PoisonError::into_inner));
+        drop(handlers);
+        drop(timers);
+    }
+
+    #[cfg(not(all(unix, not(target_os = "macos"), not(target_os = "android"))))]
+    pub(crate) fn clear_run_loop(&self) {}
+
+    /// Main-thread servicing of the run loop: the due timers, then the fds with events. Called
+    /// from [`EditorLink::idle`] while the editor is attached.
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+    pub(crate) fn service_run_loop(&self) {
+        self.service_timers();
+        self.service_fds();
+    }
+
+    #[cfg(not(all(unix, not(target_os = "macos"), not(target_os = "android"))))]
+    pub(crate) fn service_run_loop(&self) {}
+
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+    fn service_timers(&self) {
+        let now = std::time::Instant::now();
+        let due: Vec<ComPtr<sb::Linux::ITimerHandler>> = {
+            let mut timers = self.run_loop.timers.lock().unwrap_or_else(PoisonError::into_inner);
+            timers
+                .iter_mut()
+                .filter(|t| t.due <= now)
+                .map(|t| {
+                    t.due = now.checked_add(t.period).unwrap_or(now);
+                    t.handler.clone()
+                })
+                .collect()
+        };
+        for h in due {
+            // A callback may have unregistered a timer that is still on the copied list.
+            let live = self.run_loop.timers.lock().unwrap_or_else(PoisonError::into_inner).iter().any(|t| t.handler.as_ptr() == h.as_ptr());
+            if live {
+                // SAFETY: `h` holds a reference to a live handler the plugin registered; main thread.
+                unsafe { h.onTimer() };
+            }
+        }
+    }
+
+    /// `poll(2)` with a zero timeout over the registered fds; `onFDIsSet` for each with events.
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+    fn service_fds(&self) {
+        let watches: Vec<FdWatch> =
+            self.run_loop.handlers.lock().unwrap_or_else(PoisonError::into_inner).iter().map(|(h, fd)| (h.clone(), *fd)).collect();
+        if watches.is_empty() {
+            return;
+        }
+        let mut pfds: Vec<libc::pollfd> = watches.iter().map(|&(_, fd)| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
+        // SAFETY: `pfds` is a valid, writable array of `pfds.len()` pollfd structs; a zero timeout never blocks.
+        let ready = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 0) };
+        if ready <= 0 {
+            return;
+        }
+        for (p, (h, _)) in pfds.iter().zip(watches.iter()) {
+            if p.revents == 0 {
+                continue;
+            }
+            // A callback may have unregistered this handler (or fd) since the copy was taken.
+            let still =
+                self.run_loop.handlers.lock().unwrap_or_else(PoisonError::into_inner).iter().any(|(r, fd)| r.as_ptr() == h.as_ptr() && *fd == p.fd);
+            if still {
+                // SAFETY: `h` holds a reference to a live handler; `p.fd` is the fd it registered; main thread.
+                unsafe { h.onFDIsSet(p.fd) };
+            }
+        }
+    }
 }
 
 impl Class for PlugFrame {
+    #[cfg(not(all(unix, not(target_os = "macos"), not(target_os = "android"))))]
     type Interfaces = (sb::IPlugFrame,);
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+    type Interfaces = (sb::IPlugFrame, sb::Linux::IRunLoop);
+}
+
+/// The Linux `IRunLoop`: the plugin registers the fds and timers it needs the host to service.
+/// Each registration takes its own reference to the handler, released on unregister or teardown.
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+impl IRunLoopTrait for PlugFrame {
+    unsafe fn registerEventHandler(&self, handler: *mut sb::Linux::IEventHandler, fd: sb::Linux::FileDescriptor) -> sb::tresult {
+        if fd < 0 {
+            return sb::kInvalidArgument;
+        }
+        // SAFETY: a live handler from the plugin (or null, handled); `to_com_ptr` adds our reference.
+        let Some(h) = (unsafe { vst3::ComRef::from_raw(handler) }) else { return sb::kInvalidArgument };
+        let mut handlers = self.run_loop.handlers.lock().unwrap_or_else(PoisonError::into_inner);
+        if handlers.len() >= RUN_LOOP_CAP {
+            return sb::kResultFalse;
+        }
+        handlers.push((h.to_com_ptr(), fd));
+        sb::kResultOk
+    }
+
+    unsafe fn unregisterEventHandler(&self, handler: *mut sb::Linux::IEventHandler) -> sb::tresult {
+        let removed: Vec<FdWatch> = {
+            let mut handlers = self.run_loop.handlers.lock().unwrap_or_else(PoisonError::into_inner);
+            let (gone, keep): (Vec<FdWatch>, Vec<FdWatch>) = std::mem::take(&mut *handlers).into_iter().partition(|(h, _)| h.as_ptr() == handler);
+            *handlers = keep;
+            gone
+        };
+        drop(removed);
+        sb::kResultOk
+    }
+
+    unsafe fn registerTimer(&self, handler: *mut sb::Linux::ITimerHandler, milliseconds: sb::Linux::TimerInterval) -> sb::tresult {
+        // SAFETY: a live handler from the plugin (or null, handled); `to_com_ptr` adds our reference.
+        let Some(h) = (unsafe { vst3::ComRef::from_raw(handler) }) else { return sb::kInvalidArgument };
+        let period = Duration::from_millis(milliseconds.clamp(1, 60_000));
+        let now = std::time::Instant::now();
+        let mut timers = self.run_loop.timers.lock().unwrap_or_else(PoisonError::into_inner);
+        if timers.len() >= RUN_LOOP_CAP {
+            return sb::kResultFalse;
+        }
+        timers.push(RunLoopTimer { handler: h.to_com_ptr(), period, due: now.checked_add(period).unwrap_or(now) });
+        sb::kResultOk
+    }
+
+    unsafe fn unregisterTimer(&self, handler: *mut sb::Linux::ITimerHandler) -> sb::tresult {
+        let removed: Vec<RunLoopTimer> = {
+            let mut timers = self.run_loop.timers.lock().unwrap_or_else(PoisonError::into_inner);
+            let (gone, keep): (Vec<RunLoopTimer>, Vec<RunLoopTimer>) =
+                std::mem::take(&mut *timers).into_iter().partition(|t| t.handler.as_ptr() == handler);
+            *timers = keep;
+            gone
+        };
+        drop(removed);
+        sb::kResultOk
+    }
 }
 
 impl IPlugFrameTrait for PlugFrame {
@@ -2052,7 +2228,7 @@ impl EditorLink {
         unsafe { view.getSize(&mut r) };
         let (w, h) = rect_size(&r);
         let win = window::HostWindow::new(title, w, h)?;
-        let frame = ComWrapper::new(PlugFrame { window: std::sync::atomic::AtomicPtr::new(win.raw()) });
+        let frame = ComWrapper::new(PlugFrame::new(win.raw()));
         if let Some(f) = frame.as_com_ref::<sb::IPlugFrame>() {
             // SAFETY: valid view; the frame outlives the view's attachment (kept in `g.frame`
             // and detached in `teardown`).
@@ -2080,6 +2256,10 @@ impl EditorLink {
                 view.removed();
                 view.setFrame(std::ptr::null_mut());
             }
+        }
+        if let Some(f) = &g.frame {
+            // The plugin's run-loop handlers and timers go before the frame does.
+            f.clear_run_loop();
         }
         g.frame = None;
         if let Some(w) = g.window.take() {
@@ -2146,6 +2326,10 @@ impl EditorLink {
         let mut g = self.lock();
         if g.window.as_ref().is_some_and(|w| !w.is_visible()) {
             EditorLink::teardown(&mut g);
+            return;
+        }
+        if let Some(f) = &g.frame {
+            f.service_run_loop();
         }
     }
 
@@ -2569,8 +2753,77 @@ mod window {
     }
 }
 
+/// The Linux/BSD host window: a top-level X11 window (`soundcraft-x11-window`). The plugin view
+/// embeds itself in it by its X11 window id (`X11EmbedWindowID`).
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+mod window {
+    use soundcraft_x11_window::X11Window;
+    use std::ffi::{c_char, c_void};
+
+    pub const PLATFORM_TYPE: Option<*const c_char> = Some(vst3::Steinberg::kPlatformTypeX11EmbedWindowID);
+
+    /// Whether the calling thread is the process's main thread (its thread id is the process id).
+    #[cfg(target_os = "linux")]
+    pub fn on_main_thread() -> bool {
+        // SAFETY: `gettid` and `getpid` take no arguments and cannot fail.
+        unsafe { libc::gettid() == libc::getpid() }
+    }
+
+    /// Other X11 systems: no portable check; the UI drives editors from its main thread only.
+    #[cfg(not(target_os = "linux"))]
+    pub fn on_main_thread() -> bool {
+        true
+    }
+
+    /// A top-level X11 window. Boxed so its address is stable for [`HostWindow::raw`].
+    pub struct HostWindow {
+        win: Box<X11Window>,
+    }
+
+    // SAFETY: the X11 connection and window are only used on the main thread, where the UI drives
+    // editors; the struct merely carries them between the editor link's lock holders.
+    unsafe impl Send for HostWindow {}
+
+    impl HostWindow {
+        pub fn new(title: &str, w: f64, h: f64) -> Result<HostWindow, String> {
+            Ok(HostWindow { win: Box::new(X11Window::new(title, w, h)?) })
+        }
+
+        /// The boxed `X11Window` (for the plug frame's resizes).
+        pub fn raw(&self) -> *mut c_void {
+            (&*self.win as *const X11Window).cast_mut().cast()
+        }
+
+        /// The X11 window id the plugin view embeds into (the XID, as a pointer-sized integer).
+        pub fn parent(&self) -> *mut c_void {
+            self.win.id() as usize as *mut c_void
+        }
+
+        pub fn raise(&self) {
+            self.win.raise();
+        }
+
+        pub fn is_visible(&self) -> bool {
+            self.win.is_visible()
+        }
+
+        pub fn close(self) {
+            (*self.win).close();
+        }
+    }
+
+    /// Resizes a host window's content (`window` from [`HostWindow::raw`]).
+    pub fn resize(window: *mut c_void, w: f64, h: f64) {
+        // SAFETY: null, or the boxed window of a HostWindow the editor link keeps alive while the
+        // frame is attached (teardown detaches the frame before it closes the window).
+        if let Some(win) = unsafe { window.cast::<X11Window>().as_ref() } {
+            win.resize(w, h);
+        }
+    }
+}
+
 /// Other platforms: no editor windows yet (opening reports "unsupported").
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "macos", windows, all(unix, not(target_os = "macos"), not(target_os = "android")))))]
 mod window {
     use std::ffi::{c_char, c_void};
 
@@ -2721,5 +2974,164 @@ mod tests {
         assert_eq!(read_c16(&name), "SoundCraft");
         assert_eq!(h.restart_flags.load(Ordering::Relaxed), sv::RestartFlags_::kLatencyChanged as u32);
         assert_eq!(hex(&[0xAB; 16]), "AB".repeat(16));
+    }
+}
+
+#[cfg(all(test, unix, not(target_os = "macos"), not(target_os = "android")))]
+mod run_loop_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    /// A test `ITimerHandler` that counts its calls and notes when the host releases it.
+    struct TickCounter {
+        calls: Arc<AtomicU32>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Class for TickCounter {
+        type Interfaces = (sb::Linux::ITimerHandler,);
+    }
+
+    impl Drop for TickCounter {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Relaxed);
+        }
+    }
+
+    impl ITimerHandlerTrait for TickCounter {
+        unsafe fn onTimer(&self) {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A test `IEventHandler` that counts its calls and records the fd it was called for.
+    struct FdCounter {
+        calls: Arc<AtomicU32>,
+        last_fd: Arc<AtomicI32>,
+    }
+
+    impl Class for FdCounter {
+        type Interfaces = (sb::Linux::IEventHandler,);
+    }
+
+    impl IEventHandlerTrait for FdCounter {
+        unsafe fn onFDIsSet(&self, fd: sb::Linux::FileDescriptor) {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.last_fd.store(fd, Ordering::Relaxed);
+        }
+    }
+
+    /// A pipe's two ends, closed when dropped.
+    struct Pipe(c_int, c_int);
+
+    impl Pipe {
+        fn new() -> Pipe {
+            let mut fds = [0 as c_int; 2];
+            // SAFETY: `fds` is a writable array of two ints, as `pipe(2)` requires.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe(2)");
+            Pipe(fds[0], fds[1])
+        }
+    }
+
+    impl Drop for Pipe {
+        fn drop(&mut self) {
+            // SAFETY: both ends were opened by `pipe` in `Pipe::new` and are closed only here.
+            unsafe {
+                libc::close(self.0);
+                libc::close(self.1);
+            }
+        }
+    }
+
+    fn ticker() -> (ComWrapper<TickCounter>, Arc<AtomicU32>, Arc<AtomicBool>) {
+        let calls = Arc::new(AtomicU32::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let t = ComWrapper::new(TickCounter { calls: calls.clone(), dropped: dropped.clone() });
+        (t, calls, dropped)
+    }
+
+    fn fd_counter() -> (ComWrapper<FdCounter>, Arc<AtomicU32>, Arc<AtomicI32>) {
+        let calls = Arc::new(AtomicU32::new(0));
+        let last_fd = Arc::new(AtomicI32::new(-1));
+        let h = ComWrapper::new(FdCounter { calls: calls.clone(), last_fd: last_fd.clone() });
+        (h, calls, last_fd)
+    }
+
+    fn timer_ptr(t: &ComWrapper<TickCounter>) -> *mut sb::Linux::ITimerHandler {
+        t.as_com_ref::<sb::Linux::ITimerHandler>().map_or(std::ptr::null_mut(), |r| r.as_ptr())
+    }
+
+    fn fd_ptr(h: &ComWrapper<FdCounter>) -> *mut sb::Linux::IEventHandler {
+        h.as_com_ref::<sb::Linux::IEventHandler>().map_or(std::ptr::null_mut(), |r| r.as_ptr())
+    }
+
+    #[test]
+    fn a_timer_fires_until_it_is_unregistered() {
+        let frame = ComWrapper::new(PlugFrame::new(std::ptr::null_mut()));
+        let pf: &PlugFrame = &frame;
+        let (t, calls, dropped) = ticker();
+        let h = timer_ptr(&t);
+        // SAFETY: the frame's own IRunLoop implementation, with a live handler.
+        unsafe { assert_eq!(pf.registerTimer(h, 1), sb::kResultOk) };
+        std::thread::sleep(Duration::from_millis(5));
+        pf.service_run_loop();
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "a due timer fires once per service");
+        // SAFETY: as above.
+        unsafe { assert_eq!(pf.unregisterTimer(h), sb::kResultOk) };
+        std::thread::sleep(Duration::from_millis(5));
+        pf.service_run_loop();
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "an unregistered timer does not fire");
+        drop(t);
+        assert!(dropped.load(Ordering::Relaxed), "unregistering releases the frame's reference");
+    }
+
+    #[test]
+    fn an_fd_is_reported_only_when_it_has_events() {
+        let frame = ComWrapper::new(PlugFrame::new(std::ptr::null_mut()));
+        let pf: &PlugFrame = &frame;
+        let ready = Pipe::new();
+        let idle = Pipe::new();
+        let (ready_h, ready_calls, ready_fd) = fd_counter();
+        let (idle_h, idle_calls, _) = fd_counter();
+        // SAFETY: the frame's own IRunLoop implementation, with live handlers.
+        unsafe {
+            assert_eq!(pf.registerEventHandler(fd_ptr(&ready_h), ready.0), sb::kResultOk);
+            assert_eq!(pf.registerEventHandler(fd_ptr(&idle_h), idle.0), sb::kResultOk);
+        }
+        let byte = *b"x";
+        // SAFETY: `byte` is readable for one byte; the write end is open.
+        assert_eq!(unsafe { libc::write(ready.1, byte.as_ptr().cast(), 1) }, 1);
+        pf.service_run_loop();
+        assert_eq!(ready_calls.load(Ordering::Relaxed), 1, "a readable fd is reported");
+        assert_eq!(ready_fd.load(Ordering::Relaxed), ready.0);
+        assert_eq!(idle_calls.load(Ordering::Relaxed), 0, "an empty fd is not reported");
+        // SAFETY: the frame's own IRunLoop implementation.
+        unsafe {
+            assert_eq!(pf.unregisterEventHandler(fd_ptr(&ready_h)), sb::kResultOk);
+            assert_eq!(pf.unregisterEventHandler(fd_ptr(&idle_h)), sb::kResultOk);
+        }
+    }
+
+    #[test]
+    fn bad_arguments_and_the_cap_are_refused() {
+        let frame = ComWrapper::new(PlugFrame::new(std::ptr::null_mut()));
+        let pf: &PlugFrame = &frame;
+        let (h, _, _) = fd_counter();
+        let (t, _, _) = ticker();
+        // SAFETY: the frame's own IRunLoop implementation; the null and negative cases are refused
+        // before any handler is touched.
+        unsafe {
+            assert_eq!(pf.registerEventHandler(std::ptr::null_mut(), 0), sb::kInvalidArgument);
+            assert_eq!(pf.registerEventHandler(fd_ptr(&h), -1), sb::kInvalidArgument);
+            assert_eq!(pf.registerTimer(std::ptr::null_mut(), 1), sb::kInvalidArgument);
+            for _ in 0..RUN_LOOP_CAP {
+                assert_eq!(pf.registerEventHandler(fd_ptr(&h), 0), sb::kResultOk);
+                assert_eq!(pf.registerTimer(timer_ptr(&t), 1000), sb::kResultOk);
+            }
+            assert_eq!(pf.registerEventHandler(fd_ptr(&h), 0), sb::kResultFalse, "65th handler");
+            assert_eq!(pf.registerTimer(timer_ptr(&t), 1000), sb::kResultFalse, "65th timer");
+        }
+        pf.clear_run_loop();
     }
 }

@@ -4033,6 +4033,7 @@ dependencies = [
 name = "soundcraft-vst3-host"
 version = "0.10.0"
 dependencies = [
+ "libc",
  "libloading 0.8.9",
  "log",
  "objc2 0.6.5",
@@ -4040,6 +4041,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "serde",
  "soundcraft-dsp",
+ "soundcraft-x11-window",
  "thiserror 2.0.21",
  "vst3",
  "windows-sys 0.61.2",

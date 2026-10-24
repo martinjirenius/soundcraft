@@ -3,7 +3,7 @@
 
 use crate::scan::{ParamPort, PortMap};
 use livi::World;
-use soundcraft_dsp::{ParamInfo, Taper, Unit};
+use soundcraft_dsp::{FileParamInfo, ParamInfo, Taper, Unit};
 
 /// Most labels read for an enumeration parameter (as in the CLAP host).
 const MAX_CHOICES: usize = 128;
@@ -18,6 +18,13 @@ const LV2_DESIGNATION: &str = "http://lv2plug.in/ns/lv2core#designation";
 const LV2_LATENCY: &str = "http://lv2plug.in/ns/lv2core#latency";
 const LV2_ENABLED: &str = "http://lv2plug.in/ns/lv2core#enabled";
 const LV2_FREEWHEELING: &str = "http://lv2plug.in/ns/lv2core#freeWheeling";
+const LV2_ATOM_PORT: &str = "http://lv2plug.in/ns/ext/atom#AtomPort";
+const ATOM_SUPPORTS: &str = "http://lv2plug.in/ns/ext/atom#supports";
+const ATOM_PATH: &str = "http://lv2plug.in/ns/ext/atom#Path";
+const PATCH_WRITABLE: &str = "http://lv2plug.in/ns/ext/patch#writable";
+const PATCH_MESSAGE: &str = "http://lv2plug.in/ns/ext/patch#Message";
+const RDFS_RANGE: &str = "http://www.w3.org/2000/01/rdf-schema#range";
+const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
 
 /// A lilv number as a finite `f32` (floats and integers; anything else is `None`).
 fn node_f32(n: Option<&livi::lilv::node::Node>) -> Option<f32> {
@@ -117,6 +124,49 @@ pub(crate) fn params(plugin: &livi::Plugin, world: &World) -> (Vec<ParamInfo>, P
         map.latency = raw.latency_port_index();
     }
     (params, map)
+}
+
+/// The file parameters of a plugin: its `patch:writable` properties ranged `atom:Path` (a
+/// property with no range at all also counts when it has a label and the plugin takes
+/// `patch:Message`, as NAM's model does in some bundles). Only listed when the plugin has an atom
+/// input for `patch:Message`, the port the host delivers them to; that port's ordinal goes into
+/// `map.patch_input`. The strings are leaked like the parameters'. Extensions are not read: none
+/// are known generically.
+pub(crate) fn files(plugin: &livi::Plugin, world: &World, map: &mut PortMap) -> Vec<FileParamInfo> {
+    let raw_world = world.raw();
+    let raw = plugin.raw();
+    let (atom_port, input, supports) = (raw_world.new_uri(LV2_ATOM_PORT), raw_world.new_uri(LV2_INPUT_PORT), raw_world.new_uri(ATOM_SUPPORTS));
+    let message = raw_world.new_uri(PATCH_MESSAGE);
+    let mut ordinal = 0usize;
+    for lp in raw.iter_ports() {
+        if !(lp.is_a(&atom_port) && lp.is_a(&input)) {
+            continue;
+        }
+        let takes_message = lp.value(&supports).iter().any(|n| n.as_uri() == message.as_uri());
+        if takes_message && map.patch_input.is_none() {
+            map.patch_input = Some(ordinal);
+        }
+        ordinal += 1;
+    }
+    if map.patch_input.is_none() {
+        return Vec::new();
+    }
+    let (writable, range, label, path) =
+        (raw_world.new_uri(PATCH_WRITABLE), raw_world.new_uri(RDFS_RANGE), raw_world.new_uri(RDFS_LABEL), raw_world.new_uri(ATOM_PATH));
+    let mut files = Vec::new();
+    for prop in raw.value(&writable).iter() {
+        let Some(uri) = prop.as_uri() else { continue };
+        let ranges: Vec<String> = world.raw().find_nodes(Some(&prop), &range, None).iter().filter_map(|n| n.as_uri().map(str::to_string)).collect();
+        let labelled =
+            world.raw().find_nodes(Some(&prop), &label, None).iter().find_map(|n| n.as_str().map(str::to_string)).filter(|s| !s.is_empty());
+        let accepted = if ranges.is_empty() { labelled.is_some() } else { ranges.iter().any(|r| Some(r.as_str()) == path.as_uri()) };
+        if !accepted {
+            continue;
+        }
+        let name = labelled.unwrap_or_else(|| uri.rsplit(['#', '/']).next().unwrap_or(uri).to_string());
+        files.push(FileParamInfo { id: leak(uri.to_string()), name: leak(name), extensions: &[] });
+    }
+    files
 }
 
 /// Index of the scale value closest to `value` (0 when there is none).

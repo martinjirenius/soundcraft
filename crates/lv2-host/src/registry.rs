@@ -129,7 +129,8 @@ fn describe(id: &str) -> Result<(livi::Plugin, &'static PluginInfo, &'static Por
     if let Some(&(info, map)) = infos.get(id) {
         return Ok((plugin, info, map));
     }
-    let (params, map) = meta::params(&plugin, world);
+    let (params, mut map) = meta::params(&plugin, world);
+    let files = meta::files(&plugin, world, &mut map);
     let short: String = desc.name.chars().take(8).collect();
     let info: &'static PluginInfo = Box::leak(Box::new(PluginInfo {
         id: leak(desc.id.clone()),
@@ -139,6 +140,7 @@ fn describe(id: &str) -> Result<(livi::Plugin, &'static PluginInfo, &'static Por
         params: Box::leak(params.into_boxed_slice()),
         is_instrument: desc.is_instrument,
         audiosuite: false,
+        files: Box::leak(files.into_boxed_slice()),
     }));
     let map: &'static PortMap = Box::leak(Box::new(map));
     infos.insert(id.to_string(), (info, map));

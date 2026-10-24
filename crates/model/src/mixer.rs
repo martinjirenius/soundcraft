@@ -441,6 +441,10 @@ pub struct Insert {
     /// The session audio source a sample-playing instrument (the built-in Sampler) plays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample: Option<SourceId>,
+    /// File parameters: parameter id to the absolute path the session set for it (a neural model,
+    /// an impulse response). The plugin loads the file; the session only remembers the path.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BTreeMap<String, String>,
     /// Which live plugin instance this insert maps to. Not saved: a loaded insert gets a fresh tag.
     /// A host recreates the instance when the tag differs from the one it built.
     #[serde(skip, default = "InstanceTag::fresh")]
@@ -493,6 +497,7 @@ impl Insert {
             preset: String::from("<factory default>"),
             state: None,
             sample: None,
+            files: BTreeMap::new(),
             instance: InstanceTag::fresh(),
         }
     }
@@ -687,6 +692,19 @@ mod tests {
         // A hostile state string decodes to nothing rather than failing the load.
         let bad: Insert = serde_json::from_str(r#"{"plugin":"x","state":"!!!"}"#).unwrap();
         assert_eq!(bad.state_bytes(), None);
+    }
+
+    #[test]
+    fn file_params_round_trip_and_old_sessions_have_none() {
+        let mut i = Insert::new("nam");
+        i.files.insert("http://example.org/nam#model".to_string(), "/models/amp.nam".to_string());
+        let json = serde_json::to_string(&i).unwrap();
+        let back: Insert = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.files, i.files);
+        // Old sessions have no `files`; inserts without files don't write one.
+        let old: Insert = serde_json::from_str(r#"{"plugin":"nam"}"#).unwrap();
+        assert!(old.files.is_empty());
+        assert!(!serde_json::to_string(&old).unwrap().contains("files"));
     }
 
     #[test]

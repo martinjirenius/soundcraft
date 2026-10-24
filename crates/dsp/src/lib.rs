@@ -162,6 +162,8 @@ pub struct PluginInfo {
     pub is_instrument: bool,
     /// Usable as an offline (AudioSuite-style) process.
     pub audiosuite: bool,
+    /// File parameters, set with [`Plugin::set_file`].
+    pub files: &'static [FileParamInfo],
 }
 
 impl PluginInfo {
@@ -169,6 +171,21 @@ impl PluginInfo {
     pub fn param(&self, id: &str) -> Option<&'static ParamInfo> {
         self.params.iter().find(|p| p.id == id)
     }
+
+    /// Looks up a file parameter description by id.
+    pub fn file(&self, id: &str) -> Option<&'static FileParamInfo> {
+        self.files.iter().find(|f| f.id == id)
+    }
+}
+
+/// Static description of a file parameter: a parameter whose value is a file path (a neural
+/// model, an impulse response). The session stores the path; the plugin loads the file itself.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct FileParamInfo {
+    pub id: &'static str,
+    pub name: &'static str,
+    /// Accepted extensions without dots (compared case-insensitively). Empty means any file.
+    pub extensions: &'static [&'static str],
 }
 
 /// The host's transport at the start of a block, for tempo-synced plugins.
@@ -201,6 +218,13 @@ pub trait Plugin: Send {
     /// Sets a parameter (clamped into range; NaN becomes the default). `false` if `id` is unknown.
     fn set_param(&mut self, id: &str, value: f32) -> bool;
     fn param(&self, id: &str) -> Option<f32>;
+    /// Sets a file parameter to `path` (absolute). Called from the audio thread when the
+    /// session's file for `id` changes, so it must not allocate or block: the plugin hands the
+    /// path to its own loading, which happens off the audio thread. `false` if `id` is unknown
+    /// or the path is too long for the plugin to take.
+    fn set_file(&mut self, _id: &str, _path: &str) -> bool {
+        false
+    }
     /// In-place processing of `channels` planar buffers each `frames` long.
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize);
     /// True when the plugin could not do its job: it failed to activate or to process, so the

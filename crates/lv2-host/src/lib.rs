@@ -282,6 +282,79 @@ mod tests {
             assert_live(&io, stereo.as_ref());
         }
 
+        /// A NAM model file: a one-layer LSTM with 1 hidden unit (16 weights: 14 for the layer,
+        /// then the head weight and head bias). Every weight is zero but the head bias, so the
+        /// output is `head_bias` whatever the input. NeuralAudio accepts only WaveNet and LSTM
+        /// models (no Linear), and ships no model here, so the test writes one.
+        fn nam_lstm_model(dir: &std::path::Path, name: &str, head_bias: f32) -> std::path::PathBuf {
+            let path = dir.join(name);
+            let weights: Vec<String> = (0..15).map(|_| "0.0".to_string()).chain([head_bias.to_string()]).collect();
+            let json = format!(
+                r#"{{"version":"0.5.0","metadata":{{}},"architecture":"LSTM","config":{{"num_layers":1,"hidden_size":1}},"weights":[{}],"sample_rate":48000}}"#,
+                weights.join(",")
+            );
+            std::fs::write(&path, json).expect("the model file is written");
+            path
+        }
+
+        /// RMS of `x` over the frames from `from` on.
+        fn rms_from(x: &[f32], from: usize) -> f32 {
+            let tail = &x[from..];
+            (tail.iter().map(|v| v * v).sum::<f32>() / tail.len().max(1) as f32).sqrt()
+        }
+
+        #[test]
+        fn neural_amp_modeler_loads_a_model_set_as_a_file_parameter() {
+            if !installed(NAM) {
+                return;
+            }
+            let info = plugin_info(NAM).expect("NAM has a plugin info");
+            let file = info.files.first().expect("NAM lists its model as a file parameter");
+            assert_eq!(file.id, "http://github.com/mikeoliphant/neural-amp-modeler-lv2#model");
+            let dir = std::env::temp_dir().join(format!("sc-lv2-nam-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let model = nam_lstm_model(&dir, "half.nam", 0.5);
+            let mut p = instantiate(NAM).expect("NAM instantiates");
+            p.prepare(SR, 64, 1);
+            assert!(p.set_file(file.id, &model.to_string_lossy()), "NAM takes the model path");
+            assert!(!p.set_file("urn:no-such#param", "/x"), "an unknown id is refused");
+            let mut service = p.service_handle().expect("NAM runs its workers on the main thread");
+            // Two seconds of 1 kHz at 48 kHz, in 64-frame blocks, servicing the worker between them.
+            let total = 48_000 * 2;
+            let sine: Vec<f32> = (0..total).map(|i| 0.25 * (std::f32::consts::TAU * 1000.0 * i as f32 / SR).sin()).collect();
+            let mut out = Vec::with_capacity(total);
+            for chunk in sine.chunks(64) {
+                let mut io = vec![chunk.to_vec()];
+                p.process(&mut io, chunk.len());
+                out.extend_from_slice(&io[0]);
+                service.service();
+            }
+            assert!(!p.failed(), "NAM failed with the model");
+            assert!(out.iter().all(|x| x.is_finite()), "non-finite output");
+            // The last second is after the model loaded: its output is the head bias, 0.5, with
+            // no trace of the 1 kHz input (which would pass through unchanged without a model).
+            let tail = &out[48_000..];
+            let mean = tail.iter().sum::<f32>() / tail.len() as f32;
+            let spread = (tail.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / tail.len() as f32).sqrt();
+            eprintln!("NAM with the 0.5 head-bias model: mean {mean}, spread {spread}, input rms {}", rms_from(&sine, 48_000));
+            assert!((mean - 0.5).abs() < 0.02, "expected the model's constant 0.5, got mean {mean}");
+            assert!(spread < 0.02, "the output still follows the input (spread {spread})");
+            // A re-prepare (new instances, as on a sample-rate change) gets the file again.
+            p.prepare(SR, 128, 1);
+            let mut service = p.service_handle().expect("NAM runs its workers on the main thread");
+            let mut again = Vec::new();
+            for chunk in sine[..48_000].chunks(128) {
+                let mut io = vec![chunk.to_vec()];
+                p.process(&mut io, chunk.len());
+                again.extend_from_slice(&io[0]);
+                service.service();
+            }
+            let tail = &again[24_000..];
+            let mean = tail.iter().sum::<f32>() / tail.len() as f32;
+            assert!((mean - 0.5).abs() < 0.02, "after a re-prepare the model is gone (mean {mean})");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         #[test]
         fn controls_round_trip_through_the_state_blob() {
             if !installed(TREMOLO) {

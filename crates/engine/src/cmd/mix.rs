@@ -3,7 +3,7 @@
 use super::*;
 use crate::cmd;
 use serde_json::json;
-use soundcraft_model::{AutoParam, AutomationMode, INSERT_SLOTS, Insert, SEND_SLOTS, SendSlot, Session, TrackId};
+use soundcraft_model::{AutoParam, AutomationMode, INSERT_SLOTS, Insert, InstanceTag, SEND_SLOTS, SendSlot, Session, TrackId};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -96,6 +96,15 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("mix.insert_remove", "Remove Insert", [], None, "{track?, slot}", has_selection, insert_remove),
         cmd!("mix.insert_bypass", "Bypass Insert", [], None, "{track?, slot, value?: bool}", has_selection, insert_bypass),
         cmd!("mix.insert_param", "Set Plugin Parameter", [], None, "{track?, slot, param, value}", has_selection, insert_param),
+        cmd!(
+            "mix.insert_file",
+            "Load Plugin File",
+            [],
+            None,
+            "{track?, slot, param, path}: a file parameter (a plugin's model or impulse response) set to an absolute path to an existing file; path null or \"\" removes it. Extensions are checked when the plugin lists them",
+            has_selection,
+            insert_file
+        ),
         cmd!(
             "mix.insert_reset",
             "Reset Plugin to Factory Default",
@@ -392,6 +401,78 @@ fn insert_param(e: &mut Engine, p: &Value) -> Result<Value> {
     let v = value.clamp(pi.min, pi.max);
     ins.params.insert(param, v);
     Ok(json!({"value": v}))
+}
+
+/// Longest file path a plugin can be handed (also the limit of the plugin-side buffer).
+const MAX_FILE_PATH: usize = 4096;
+
+/// Sets (or, with a null or empty `path`, removes) one file parameter of an insert. The path is
+/// checked here so a plugin never receives a path it cannot use: absolute, short, no NUL, an
+/// existing regular file, and of an accepted extension.
+fn insert_file(e: &mut Engine, p: &Value) -> Result<Value> {
+    const CMD: &str = "mix.insert_file";
+    let (t, slot) = track_slot(e, p, CMD, INSERT_SLOTS)?;
+    let param = str_param(p, "param").ok_or_else(|| bad(CMD, "`param` required"))?.to_string();
+    let path = match p.get("path") {
+        None => return Err(bad(CMD, "`path` required (null removes the file)")),
+        Some(Value::Null) => None,
+        Some(v) => match v.as_str() {
+            Some("") => None,
+            Some(s) => Some(s.to_string()),
+            None => return Err(bad(CMD, "`path` must be a string or null")),
+        },
+    };
+    let plugin_id = e
+        .session()
+        .track(t)
+        .and_then(|tr| tr.mixer.inserts.get(slot))
+        .and_then(Option::as_ref)
+        .map(|ins| ins.plugin.clone())
+        .ok_or_else(|| bad(CMD, "empty slot"))?;
+    let info = super::clap::plugin_info(&plugin_id).ok_or_else(|| bad(CMD, "unknown plugin"))?;
+    let fi = info.file(&param).ok_or_else(|| bad(CMD, format!("`{}` has no file parameter `{param}`", info.id)))?;
+    if let Some(path) = &path {
+        check_file_path(path, fi.extensions).map_err(|why| bad(CMD, why))?;
+    }
+    let ins =
+        e.session_mut().track_mut(t).and_then(|tr| tr.mixer.inserts.get_mut(slot)).and_then(Option::as_mut).ok_or_else(|| bad(CMD, "empty slot"))?;
+    match &path {
+        Some(path) => {
+            ins.files.insert(param.clone(), path.clone());
+        }
+        None => {
+            // A plugin cannot unload its file, so a removed one means a new instance: the host
+            // rebuilds the plugin (as after a factory reset) and it starts without the file.
+            if ins.files.remove(&param).is_some() {
+                ins.instance = InstanceTag::fresh();
+            }
+        }
+    }
+    Ok(json!({"param": param, "path": path}))
+}
+
+/// Why `path` cannot be handed to a file parameter that accepts `extensions` (empty = any).
+fn check_file_path(path: &str, extensions: &[&str]) -> std::result::Result<(), String> {
+    if path.len() > MAX_FILE_PATH {
+        return Err(format!("path is longer than {MAX_FILE_PATH} bytes"));
+    }
+    if path.contains('\0') {
+        return Err("path contains a NUL byte".into());
+    }
+    let p = std::path::Path::new(path);
+    if !p.is_absolute() {
+        return Err(format!("path must be absolute: {path}"));
+    }
+    if !crate::io::file_found(p) {
+        return Err(format!("not an existing file: {path}"));
+    }
+    if !extensions.is_empty() {
+        let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
+        if !extensions.iter().any(|allowed| allowed.eq_ignore_ascii_case(ext)) {
+            return Err(format!("expected a .{} file, got {path}", extensions.join(" or .")));
+        }
+    }
+    Ok(())
 }
 
 /// Factory Default: the plugin's own defaults, never the advertised ones. Every stored value goes,
@@ -948,6 +1029,80 @@ mod tests {
         // Empty params with a preset name still recall (the rename path).
         e.execute("mix.insert_params", &json!({"track": t, "slot": 0, "params": {}, "preset": "Saved"})).unwrap();
         assert_eq!(e.session().tracks[0].mixer.inserts[0].as_ref().unwrap().preset, "Saved");
+    }
+
+    #[test]
+    fn insert_file_rejects_every_bad_target_and_path_without_an_undo_step() {
+        let mut e = Engine::default();
+        e.execute("track.new", &json!({})).unwrap();
+        let t = e.session().tracks[0].id.0;
+        e.execute("mix.insert", &json!({"track": t, "slot": 0, "plugin": "gain"})).unwrap();
+        let dir = std::env::temp_dir().join(format!("sc-insert-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("amp.NAM");
+        std::fs::write(&model, b"{}").unwrap();
+        let model = model.to_str().unwrap().to_string();
+        let history = e.undo_history().len();
+        let cases = [
+            json!({"track": t, "slot": 1, "param": "model", "path": model}),          // empty slot
+            json!({"track": t, "slot": 0, "param": "model", "path": model}),          // no file parameter
+            json!({"track": t, "slot": 0, "param": "model"}),                         // path missing
+            json!({"track": t, "slot": 0, "param": "model", "path": 3}),              // not a string
+            json!({"track": t, "slot": 0, "param": "model", "path": "amp.nam"}),      // relative
+            json!({"track": t, "slot": 0, "param": "model", "path": "/no/such.nam"}), // missing file
+            json!({"track": t, "slot": 0, "param": "model", "path": format!("{model}\0x")}), // NUL
+            json!({"track": t, "slot": 0, "param": "model", "path": format!("/{}", "a".repeat(MAX_FILE_PATH))}),
+        ];
+        for bad_params in cases {
+            assert!(e.execute("mix.insert_file", &bad_params).is_err(), "{bad_params} accepted");
+        }
+        assert_eq!(e.undo_history().len(), history);
+        assert!(e.session().tracks[0].mixer.inserts[0].as_ref().unwrap().files.is_empty());
+        // Extension rules: a plugin listing `nam` accepts `amp.NAM` and refuses other files. The
+        // check itself is a pure function, tested directly.
+        let wav = dir.join("ir.wav");
+        std::fs::write(&wav, b"x").unwrap();
+        let wav = wav.to_str().unwrap().to_string();
+        assert!(check_file_path(&model, &["nam"]).is_ok());
+        assert!(check_file_path(&wav, &["nam"]).unwrap_err().contains("expected a .nam"));
+        assert!(check_file_path(&wav, &[]).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn insert_file_sets_removes_and_undoes_a_plugin_file() {
+        const NAM: &str = "lv2:http://github.com/mikeoliphant/neural-amp-modeler-lv2";
+        const MODEL: &str = "http://github.com/mikeoliphant/neural-amp-modeler-lv2#model";
+        if super::super::clap::plugin_info(NAM).is_none() {
+            eprintln!("SKIPPED: neural-amp-modeler is not installed");
+            return;
+        }
+        let mut e = Engine::default();
+        e.execute("track.new", &json!({})).unwrap();
+        let t = e.session().tracks[0].id.0;
+        e.execute("mix.insert", &json!({"track": t, "slot": 0, "plugin": NAM})).unwrap();
+        let dir = std::env::temp_dir().join(format!("sc-insert-file-nam-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("amp.nam");
+        std::fs::write(&model, b"{}").unwrap();
+        let model = model.to_str().unwrap().to_string();
+        let files = |e: &Engine| e.session().tracks[0].mixer.inserts[0].as_ref().unwrap().files.clone();
+        let tag = |e: &Engine| e.session().tracks[0].mixer.inserts[0].as_ref().unwrap().instance;
+        let loaded = tag(&e);
+        e.execute("mix.insert_file", &json!({"track": t, "slot": 0, "param": MODEL, "path": model})).unwrap();
+        assert_eq!(files(&e).get(MODEL), Some(&model));
+        // Setting a file is delivered to the live plugin: the instance stays.
+        assert!(tag(&e).same_instance(&loaded));
+        // Empty removes and retags the insert, so the plugin restarts without its model; an undo
+        // brings the file back.
+        e.execute("mix.insert_file", &json!({"track": t, "slot": 0, "param": MODEL, "path": ""})).unwrap();
+        assert!(files(&e).is_empty());
+        assert!(!tag(&e).same_instance(&loaded));
+        assert!(e.undo());
+        assert_eq!(files(&e).get(MODEL), Some(&model));
+        assert!(e.undo());
+        assert!(files(&e).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Plugin parity: built-in processors and plugin hosting
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-24 · **Change:** minor (LV2 effects hosted on Linux: audio, parameters, control state; no editors yet; previously trivial: Sampler ping-pong loop phase (#463); previously trivial: mix.instrument sets built-in instrument parameters in params (#265); previously minor: plugin editors on Windows) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-24 · **Change:** minor (LV2 effects hosted on Linux: audio, parameters, control state, file parameters such as NAM models; no editors yet; previously trivial: Sampler ping-pong loop phase (#463); previously trivial: mix.instrument sets built-in instrument parameters in params (#265); previously minor: plugin editors on Windows) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Pro Tools users live in plugins: the bundled set covers everyday mixing, and third-party plugins
 cover the rest. This doc tracks both. Our plugins have our own names and are written from
@@ -38,7 +38,7 @@ User report #152: a saved instrument level does not reach the bounce.
 | Feature | Pro Tools | SoundCraft | Notes |
 |---|---|---|---|
 | Plugin format | AAX only (Native and DSP) | CLAP, VST3, LV2 (Linux), Audio Units (macOS) | Users' libraries mostly ship VST3/AU too. AAX (#109) needs Avid's SDK licence and PACE signing: owner decision, likely never |
-| LV2 effects | — | ✅ audio, parameters, control state (no editors or file parameters yet) | Beyond Pro Tools. Hosted through livi over the system lilv (Linux). LV2 instruments are not offered until notes reach them (MIDI to their atom port); CV ports and LV2 state extensions not hosted |
+| LV2 effects | — | ✅ audio, parameters, control state, file parameters (NAM models, set from the session with `mix.insert_file`); no editors yet | Beyond Pro Tools. Hosted through livi over the system lilv (Linux). LV2 instruments are not offered until notes reach them (MIDI to their atom port); CV ports and LV2 state extensions not hosted |
 | VST2, LADSPA | — | ❌ (#30) | Beyond Pro Tools; VST2 SDK is no longer licensable |
 | Scan, vendor menus, instrument picker | ✅ | ✅ | #23 |
 | Audio, parameters, automation, latency (PDC) | ✅ | ✅ | |
@@ -59,6 +59,7 @@ User report #152: a saved instrument level does not reach the bounce.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-24 | minor | LV2 file parameters: a plugin's model file set from the session and saved with it (NAM through `patch:Set`) |
 | 2026-10-24 | minor | LV2 effects hosted (soundcraft-lv2-host): audio, parameters, control state; no editors yet |
 | 2026-10-13 | trivial | Sampler ping-pong loop phase (#463) |
 | 2026-10-13 | trivial | mix.instrument sets built-in instrument parameters in params (#265) |

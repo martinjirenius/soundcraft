@@ -445,6 +445,45 @@ pub(crate) fn undo_history(app: &mut SoundApp, ui: &mut Ui) {
     });
 }
 
+/// The file parameters of an insert (a plugin's model, say): each shows the file it has, with
+/// Load and Clear. A refused file is reported in the status line.
+fn file_params(
+    app: &mut SoundApp,
+    ui: &mut egui::Ui,
+    tid: soundcraft_model::TrackId,
+    slot: usize,
+    info: &soundcraft_dsp::PluginInfo,
+    ins: &soundcraft_model::Insert,
+) {
+    for f in info.files {
+        ui.horizontal(|ui| {
+            ui.label(f.name);
+            let current = ins.files.get(f.id).map(|p| std::path::Path::new(p).file_name().and_then(|n| n.to_str()).unwrap_or(p.as_str()));
+            let shown = current.unwrap_or("None");
+            let label = ui.label(egui::RichText::new(shown).font(mono(11.0)).color(Tokens::current().text_dim));
+            if let Some(full) = ins.files.get(f.id) {
+                label.on_hover_text(full);
+            }
+            let mut report = None;
+            let can_pick = app.services.pick_open.is_some();
+            let load = ui.add_enabled(can_pick, egui::Button::new("Load…"));
+            let load = if can_pick { load } else { load.on_disabled_hover_text("Choosing files needs the desktop app") };
+            if load.clicked()
+                && let Some(pick) = &app.services.pick_open
+                && let Some(path) = pick(f.name, f.extensions)
+            {
+                report = app.run("mix.insert_file", json!({"track": tid.0, "slot": slot, "param": f.id, "path": path})).err();
+            }
+            if ins.files.contains_key(f.id) && ui.button("Clear").clicked() {
+                report = app.run("mix.insert_file", json!({"track": tid.0, "slot": slot, "param": f.id, "path": null})).err();
+            }
+            if let Some(e) = report {
+                app.ui.status = format!("{}: {e}", info.name);
+            }
+        });
+    }
+}
+
 fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
     let wins = app.ui.plugin_windows.clone();
     let mut keep = Vec::new();
@@ -507,6 +546,9 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
                 }
                 if info.id == "eq_7band" || info.id == "eq_1band" {
                     eq_curve(ui, info.id, &ins);
+                }
+                if !instrument {
+                    file_params(app, ui, tid, slot, info, &ins);
                 }
                 // A hosted plugin's parameter nobody set is the plugin's own: show its live value.
                 let live = app.player.as_ref().filter(|_| soundcraft_mix::is_third_party(&ins.plugin)).map(soundcraft_playback::Player::live_params);

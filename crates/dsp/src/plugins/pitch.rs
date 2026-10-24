@@ -21,6 +21,7 @@ pub static PITCH_INFO: PluginInfo = PluginInfo {
     params: &PITCH_PARAMS,
     is_instrument: false,
     audiosuite: true,
+    files: &[],
 };
 
 pub struct PitchShifter {

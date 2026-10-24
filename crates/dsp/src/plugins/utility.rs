@@ -51,6 +51,7 @@ pub static SHIFT_INFO: PluginInfo = PluginInfo {
     params: &SHIFT_PARAMS,
     is_instrument: false,
     audiosuite: false,
+    files: &[],
 };
 
 /// Delays the signal by `delay_ms + delay_samples`; changes crossfade between taps (no clicks).
@@ -151,6 +152,7 @@ pub static GAIN_INFO: PluginInfo = PluginInfo {
     params: &GAIN_PARAMS,
     is_instrument: false,
     audiosuite: true,
+    files: &[],
 };
 
 /// Smoothed gain change (-inf .. +24 dB).
@@ -207,6 +209,7 @@ pub static TRIM_INFO: PluginInfo = PluginInfo {
     params: &TRIM_PARAMS,
     is_instrument: false,
     audiosuite: true,
+    files: &[],
 };
 
 /// Trim (-inf .. +12 dB) with a click-free polarity switch.
@@ -254,8 +257,16 @@ impl Plugin for Trim {
 
 // ---------------------------------------------------------------------------------------------
 
-pub static INVERT_INFO: PluginInfo =
-    PluginInfo { id: "invert", name: "Invert", short_name: "Invert", category: Category::Other, params: &[], is_instrument: false, audiosuite: true };
+pub static INVERT_INFO: PluginInfo = PluginInfo {
+    id: "invert",
+    name: "Invert",
+    short_name: "Invert",
+    category: Category::Other,
+    params: &[],
+    is_instrument: false,
+    audiosuite: true,
+    files: &[],
+};
 
 /// Polarity inversion.
 #[derive(Default)]
@@ -301,6 +312,7 @@ pub static DC_INFO: PluginInfo = PluginInfo {
     params: &DC_PARAMS,
     is_instrument: false,
     audiosuite: true,
+    files: &[],
 };
 
 /// One-pole DC-blocking high-pass.
@@ -368,6 +380,7 @@ pub static GEN_INFO: PluginInfo = PluginInfo {
     params: &GEN_PARAMS,
     is_instrument: false,
     audiosuite: true,
+    files: &[],
 };
 
 /// Test-tone and noise generator; replaces its input.
@@ -453,6 +466,7 @@ pub static DITHER_INFO: PluginInfo = PluginInfo {
     params: &DITHER_PARAMS,
     is_instrument: false,
     audiosuite: true,
+    files: &[],
 };
 
 /// TPDF dither and requantization with optional first-order error-feedback noise shaping.

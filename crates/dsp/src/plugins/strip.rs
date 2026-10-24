@@ -39,6 +39,7 @@ pub static STRIP_INFO: PluginInfo = PluginInfo {
     params: &STRIP_PARAMS,
     is_instrument: false,
     audiosuite: true,
+    files: &[],
 };
 
 #[derive(Clone, Copy)]

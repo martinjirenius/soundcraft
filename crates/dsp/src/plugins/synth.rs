@@ -98,6 +98,7 @@ pub static SYNTH_INFO: PluginInfo = PluginInfo {
     params: &SYNTH_PARAMS,
     is_instrument: true,
     audiosuite: false,
+    files: &[],
 };
 
 const VOICES: usize = 16;

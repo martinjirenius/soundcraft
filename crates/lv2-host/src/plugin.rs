@@ -15,7 +15,7 @@
 use crate::ffi::{self, free_instances};
 use crate::registry;
 use crate::scan::{ParamPort, PortMap};
-use livi::event::LV2AtomSequence;
+use livi::event::{LV2AtomEventBuilder, LV2AtomSequence};
 use livi::{Features, Instance, PortIndex, WorkerManager};
 use soundcraft_dsp::{Plugin, PluginInfo, PluginService, ServiceReport};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -30,6 +30,118 @@ const ATOM_CAPACITY: usize = 8192;
 const STATE_MAGIC: &[u8] = b"SCL2";
 /// Largest state blob accepted (hostile input).
 const MAX_STATE: usize = 1 << 20;
+/// Longest file path a file parameter takes (`set_file` refuses longer ones).
+pub const MAX_FILE_PATH: usize = 4096;
+/// Largest `patch:Set` event body: the object header, two properties and a path with its NUL,
+/// padded (see [`write_set_body`]).
+const EVENT_BYTES: usize = 4160;
+/// Room one `patch:Set` event takes in its atom sequence: its header and body.
+const EVENT_SPACE: usize = EVENT_BYTES + 32;
+
+/// URIDs of the atom and patch terms a file parameter is delivered with. Zero when unmapped.
+#[derive(Clone, Copy, Default)]
+struct PatchUrids {
+    /// `atom:Object`, the event's type.
+    object: u32,
+    /// `patch:Set`, the object's type.
+    set: u32,
+    /// `patch:property` and `patch:value`, the keys of the two properties.
+    property: u32,
+    value: u32,
+    /// `atom:URID` and `atom:Path`, the value types.
+    urid_type: u32,
+    path_type: u32,
+}
+
+impl PatchUrids {
+    fn new(features: &Features) -> PatchUrids {
+        let urid = |uri: &[u8]| std::ffi::CStr::from_bytes_with_nul(uri).map_or(0, |c| features.urid(c));
+        PatchUrids {
+            object: urid(b"http://lv2plug.in/ns/ext/atom#Object\0"),
+            set: urid(b"http://lv2plug.in/ns/ext/patch#Set\0"),
+            property: urid(b"http://lv2plug.in/ns/ext/patch#property\0"),
+            value: urid(b"http://lv2plug.in/ns/ext/patch#value\0"),
+            urid_type: urid(b"http://lv2plug.in/ns/ext/atom#URID\0"),
+            path_type: urid(b"http://lv2plug.in/ns/ext/atom#Path\0"),
+        }
+    }
+}
+
+/// One file parameter as the plugin holds it. The path and the body built from it are kept
+/// across `prepare`, so new instances get the file again.
+struct FileSlot {
+    /// URID of the property (the parameter's id).
+    prop: u32,
+    /// The path last set (at most `MAX_FILE_PATH` bytes, reserved in `with_capacity`).
+    path: Vec<u8>,
+    /// The `patch:Set` object body for `path` (reserved in `with_capacity`).
+    body: Vec<u8>,
+    /// Not yet delivered to the instances.
+    pending: bool,
+}
+
+impl FileSlot {
+    fn with_capacity() -> FileSlot {
+        FileSlot { prop: 0, path: Vec::with_capacity(MAX_FILE_PATH), body: Vec::with_capacity(EVENT_BYTES), pending: false }
+    }
+}
+
+/// Where pending file parameters go: the atom input port, the event type, and the slots.
+#[derive(Clone, Copy)]
+struct Delivery<'a> {
+    port: usize,
+    event_type: u32,
+    files: &'a [FileSlot],
+}
+
+/// Writes the object body of a `patch:Set` that sets property `prop` to `path`: the object's id
+/// and type, then `patch:property` (an `atom:URID` naming `prop`) and `patch:value` (an
+/// `atom:Path`, NUL-terminated). Every atom is padded to 8 bytes, relative to the body's start,
+/// which is 8-aligned in the sequence. The event that carries it is typed `atom:Object`.
+/// Returns false, leaving `out` empty, when the path is too long or `out` cannot hold the body
+/// without growing (the caller reserves it, so this never allocates).
+fn write_set_body(out: &mut Vec<u8>, u: &PatchUrids, prop: u32, path: &[u8]) -> bool {
+    out.clear();
+    if path.len() > MAX_FILE_PATH || path.contains(&0) {
+        return false;
+    }
+    let value_len = path.len() + 1;
+    let total = 48 + pad8(value_len);
+    if out.capacity() < total {
+        return false;
+    }
+    put_u32(out, 0);
+    put_u32(out, u.set);
+    put_u32(out, u.property);
+    put_u32(out, 0);
+    put_u32(out, 4);
+    put_u32(out, u.urid_type);
+    put_u32(out, prop);
+    pad8_vec(out);
+    put_u32(out, u.value);
+    put_u32(out, 0);
+    put_u32(out, value_len as u32);
+    put_u32(out, u.path_type);
+    out.extend_from_slice(path);
+    out.push(0);
+    pad8_vec(out);
+    out.len() == total
+}
+
+fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_ne_bytes());
+}
+
+/// Bytes of `n` rounded up to a multiple of 8.
+fn pad8(n: usize) -> usize {
+    n.div_ceil(8) * 8
+}
+
+fn pad8_vec(out: &mut Vec<u8>) {
+    while !out.len().is_multiple_of(8) {
+        out.push(0);
+    }
+}
 
 /// One LV2 instance with the buffers it runs on.
 struct Lane {
@@ -43,24 +155,39 @@ struct Lane {
 }
 
 impl Lane {
-    fn new(inst: Instance, shape: Shape, mb: usize, features: &Features) -> Lane {
+    /// `patch` is the atom input that takes file parameters, with room for `files` of them.
+    fn new(inst: Instance, shape: Shape, mb: usize, features: &Features, patch: Option<(usize, usize)>) -> Lane {
+        let in_capacity = |i: usize| match patch {
+            Some((port, files)) if port == i => ATOM_CAPACITY + files * EVENT_SPACE,
+            _ => ATOM_CAPACITY,
+        };
         Lane {
             inst,
             ins: vec![vec![0.0; mb]; shape.audio_in],
             outs: vec![vec![0.0; mb]; shape.audio_out],
-            atoms_in: (0..shape.atoms_in).map(|_| LV2AtomSequence::new(features, ATOM_CAPACITY)).collect(),
+            atoms_in: (0..shape.atoms_in).map(|i| LV2AtomSequence::new(features, in_capacity(i))).collect(),
             atoms_out: (0..shape.atoms_out).map(|_| LV2AtomSequence::new(features, ATOM_CAPACITY)).collect(),
         }
     }
 
     /// Runs `frames` (at most the prepared block) on this lane. Atom inputs are emptied first, so
-    /// events are per block. False when the plugin reports a failure.
-    fn run(&mut self, frames: usize) -> bool {
+    /// events are per block; pending file parameters are put into the patch port first. False
+    /// when the plugin reports a failure, or a file event does not fit.
+    fn run(&mut self, frames: usize, delivery: Option<Delivery<'_>>) -> bool {
         for seq in &mut self.atoms_in {
             seq.clear();
         }
         for seq in &mut self.atoms_out {
             seq.clear_as_chunk();
+        }
+        if let Some(d) = delivery {
+            let Some(seq) = self.atoms_in.get_mut(d.port) else { return false };
+            for f in d.files.iter().filter(|f| f.pending) {
+                let Ok(event) = LV2AtomEventBuilder::<EVENT_BYTES>::new(0, d.event_type, &f.body) else { return false };
+                if seq.push_event(&event).is_err() {
+                    return false;
+                }
+            }
         }
         ffi::run_block(&mut self.inst, frames, &self.ins, &mut self.outs, &self.atoms_in, &mut self.atoms_out)
     }
@@ -97,6 +224,10 @@ pub struct Lv2Plugin {
     latency: usize,
     /// The worker manager of the current feature set, for the main-thread service.
     workers: Arc<Mutex<Option<Arc<WorkerManager>>>>,
+    /// URIDs of the current feature set (zero before the first `prepare`).
+    patch: PatchUrids,
+    /// One slot per `info.files` entry, in order.
+    files: Vec<FileSlot>,
 }
 
 impl Lv2Plugin {
@@ -118,6 +249,8 @@ impl Lv2Plugin {
             failed: false,
             latency: 0,
             workers: Arc::new(Mutex::new(None)),
+            patch: PatchUrids::default(),
+            files: Vec::new(),
         }
     }
 
@@ -181,11 +314,22 @@ impl Plugin for Lv2Plugin {
         self.per_channel = self.shape.audio_in == 1 && self.shape.audio_out == 1 && ch > 1;
         let features = registry::features(mb);
         free_instances(std::mem::take(&mut self.lanes));
+        self.patch = PatchUrids::new(&features);
+        // File parameters survive a prepare (a new instance needs its model again): every slot
+        // that holds a path is delivered once more.
+        let mut files = std::mem::take(&mut self.files);
+        files.resize_with(self.info.files.len(), FileSlot::with_capacity);
+        for (slot, info) in files.iter_mut().zip(self.info.files) {
+            slot.prop = std::ffi::CString::new(info.id).map_or(0, |c| features.urid(c.as_c_str()));
+            slot.pending = slot.prop != 0 && !slot.path.is_empty() && write_set_body(&mut slot.body, &self.patch, slot.prop, &slot.path);
+        }
+        self.files = files;
+        let patch = self.map.patch_input.map(|port| (port, self.info.files.len()));
         let count = if self.per_channel { ch } else { 1 };
         let mut lanes: Vec<Lane> = Vec::with_capacity(count);
         for _ in 0..count {
             match ffi::instantiate(&self.plugin, Arc::clone(&features), sr) {
-                Ok(inst) => lanes.push(Lane::new(inst, self.shape, mb, &features)),
+                Ok(inst) => lanes.push(Lane::new(inst, self.shape, mb, &features, patch)),
                 Err(e) => {
                     log::warn!("{}: cannot instantiate: {e}", self.info.id);
                     return;
@@ -199,7 +343,7 @@ impl Plugin for Lv2Plugin {
         // port has its value before the first real block.
         features.worker_manager().run_workers();
         if let Some(lane) = lanes.first_mut() {
-            if !lane.run(mb) {
+            if !lane.run(mb, None) {
                 log::warn!("{}: the first block failed", self.info.id);
                 return;
             }
@@ -233,6 +377,25 @@ impl Plugin for Lv2Plugin {
         self.values.get(self.param_index(id)?).copied()
     }
 
+    /// Queues `path` for file parameter `id`: it is put into the instances' patch port at the
+    /// start of the next block. Builds the event body into the slot's reserved buffer (no
+    /// allocation); refuses an unknown id, a path too long or empty (or with a NUL), and a
+    /// plugin not yet prepared or without a patch input.
+    fn set_file(&mut self, id: &str, path: &str) -> bool {
+        let Some(i) = self.info.files.iter().position(|f| f.id == id) else { return false };
+        if self.map.patch_input.is_none() || self.patch.object == 0 || path.is_empty() || path.len() > MAX_FILE_PATH {
+            return false;
+        }
+        let Some(slot) = self.files.get_mut(i) else { return false };
+        if slot.prop == 0 || !write_set_body(&mut slot.body, &self.patch, slot.prop, path.as_bytes()) {
+            return false;
+        }
+        slot.path.clear();
+        slot.path.extend_from_slice(path.as_bytes());
+        slot.pending = true;
+        true
+    }
+
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
         if self.failed || self.lanes.is_empty() {
             return;
@@ -242,18 +405,24 @@ impl Plugin for Lv2Plugin {
         if ch == 0 || frames == 0 {
             return;
         }
+        // Pending file parameters go to every instance in the block's first piece.
+        let deliver = self.map.patch_input.filter(|_| self.patch.object != 0 && self.files.iter().any(|f| f.pending));
         let mut start = 0usize;
         let mut ok = true;
         while start < frames && ok {
             let n = (frames - start).min(self.max_block);
             let range = start..start + n;
+            let delivery = match deliver {
+                Some(port) if start == 0 => Some(Delivery { port, event_type: self.patch.object, files: &self.files }),
+                _ => None,
+            };
             if self.per_channel {
                 for (k, lane) in self.lanes.iter_mut().enumerate().take(ch) {
                     if let (Some(src), Some(dst)) = (io.get(k).and_then(|s| s.get(range.clone())), lane.ins.first_mut().and_then(|d| d.get_mut(..n)))
                     {
                         dst.copy_from_slice(src);
                     }
-                    if !lane.run(n) {
+                    if !lane.run(n, delivery) {
                         ok = false;
                         break;
                     }
@@ -270,7 +439,7 @@ impl Plugin for Lv2Plugin {
                         _ => dst.fill(0.0),
                     }
                 }
-                ok = lane.run(n);
+                ok = lane.run(n, delivery);
                 if ok {
                     for (c, output) in lane.outs.iter().enumerate().take(ch) {
                         if let (Some(src), Some(dst)) = (output.get(..n), io.get_mut(c).and_then(|s| s.get_mut(range.clone()))) {
@@ -285,6 +454,11 @@ impl Plugin for Lv2Plugin {
             // No logging on the audio path: the flag is the report.
             self.failed = true;
             return;
+        }
+        if deliver.is_some() {
+            for f in &mut self.files {
+                f.pending = false;
+            }
         }
         if let Some(lane) = self.lanes.first() {
             self.latency = latency_of(&lane.inst, self.map);
@@ -345,5 +519,55 @@ impl PluginService for Lv2Service {
             m.run_workers();
         }
         ServiceReport { values_changed: false, dirty: false }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn word(b: &[u8], at: usize) -> u32 {
+        u32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+    }
+
+    #[test]
+    fn set_body_has_the_patch_set_layout_with_padding() {
+        let u = PatchUrids { object: 1, set: 2, property: 3, value: 4, urid_type: 5, path_type: 6 };
+        let mut out = Vec::with_capacity(EVENT_BYTES);
+        let path = b"/m/a.nam";
+        assert!(write_set_body(&mut out, &u, 7, path));
+        // Object: id 0, type patch:Set (48 bytes for an 8-byte path + NUL, padded to 16).
+        assert_eq!(out.len(), 48 + 16);
+        assert_eq!((word(&out, 0), word(&out, 4)), (0, 2));
+        // patch:property = URID of the parameter, inside an atom of 4 bytes padded to 16.
+        assert_eq!((word(&out, 8), word(&out, 12)), (3, 0));
+        assert_eq!((word(&out, 16), word(&out, 20), word(&out, 24)), (4, 5, 7));
+        assert_eq!(word(&out, 28), 0, "padding after the 4-byte URID");
+        // patch:value = the path with its NUL, an atom of len+1 bytes padded to 8.
+        assert_eq!((word(&out, 32), word(&out, 36)), (4, 0));
+        assert_eq!((word(&out, 40), word(&out, 44)), (9, 6));
+        assert_eq!(&out[48..56], path);
+        assert_eq!(out[56], 0, "NUL terminator");
+        assert!(out[57..].iter().all(|&b| b == 0), "zero padding");
+        // Every atom starts 8-aligned relative to the body.
+        for at in [16usize, 32, 48] {
+            assert_eq!(at % 8, 0);
+        }
+    }
+
+    #[test]
+    fn set_body_refuses_long_paths_nul_and_small_buffers() {
+        let u = PatchUrids { object: 1, set: 2, property: 3, value: 4, urid_type: 5, path_type: 6 };
+        let mut out = Vec::with_capacity(EVENT_BYTES);
+        let long = vec![b'a'; MAX_FILE_PATH + 1];
+        assert!(!write_set_body(&mut out, &u, 7, &long));
+        assert!(!write_set_body(&mut out, &u, 7, b"/a\0b"));
+        let mut small = Vec::with_capacity(16);
+        assert!(!write_set_body(&mut small, &u, 7, b"/m/a.nam"));
+        assert!(small.is_empty());
+        // The longest allowed path still fits the reserved event size.
+        let max = vec![b'a'; MAX_FILE_PATH];
+        assert!(write_set_body(&mut out, &u, 7, &max));
+        assert!(out.len() <= EVENT_BYTES);
     }
 }

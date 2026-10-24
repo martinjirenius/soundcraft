@@ -24,6 +24,9 @@ pub(crate) struct PortMap {
     pub freewheel: Option<usize>,
     /// The control output that reports the plugin's latency in samples.
     pub latency: Option<usize>,
+    /// The atom input that takes `patch:Message` (file parameters are delivered to it), as its
+    /// ordinal among the plugin's atom inputs (the order `livi` connects them in).
+    pub patch_input: Option<usize>,
 }
 
 /// SoundCraft's insert category for a plugin with these LV2 classes (labels, parents included).

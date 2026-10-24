@@ -66,6 +66,7 @@ pub static SAMPLER_INFO: PluginInfo = PluginInfo {
     params: &SAMPLER_PARAMS,
     is_instrument: true,
     audiosuite: false,
+    files: &[],
 };
 
 const VOICES: usize = 32;

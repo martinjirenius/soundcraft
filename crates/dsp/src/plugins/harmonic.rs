@@ -20,6 +20,7 @@ pub static SAT_INFO: PluginInfo = PluginInfo {
     params: &SAT_PARAMS,
     is_instrument: false,
     audiosuite: true,
+    files: &[],
 };
 
 /// Smooth tanh waveshaper, normalized so a full-scale input still peaks near full scale (more
@@ -138,6 +139,7 @@ pub static LOFI_INFO: PluginInfo = PluginInfo {
     params: &LOFI_PARAMS,
     is_instrument: false,
     audiosuite: true,
+    files: &[],
 };
 
 /// Bit crusher and sample-and-hold decimator with optional hiss.
@@ -241,6 +243,7 @@ pub static RECT_INFO: PluginInfo = PluginInfo {
     params: &RECT_PARAMS,
     is_instrument: false,
     audiosuite: true,
+    files: &[],
 };
 
 /// Half/full-wave rectifier (octave-up harmonics) with DC removal.

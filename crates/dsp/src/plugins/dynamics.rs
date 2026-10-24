@@ -53,6 +53,7 @@ pub static COMP_INFO: PluginInfo = PluginInfo {
     params: &COMP_PARAMS,
     is_instrument: false,
     audiosuite: true,
+    files: &[],
 };
 
 /// Feed-forward compressor / limiter with optional lookahead and sidechain high-pass.
@@ -217,6 +218,7 @@ pub static GATE_INFO: PluginInfo = PluginInfo {
     params: &GATE_PARAMS,
     is_instrument: false,
     audiosuite: true,
+    files: &[],
 };
 
 /// Downward expander / gate with hold.
@@ -347,6 +349,7 @@ pub static DEESS_INFO: PluginInfo = PluginInfo {
     params: &DEESS_PARAMS,
     is_instrument: false,
     audiosuite: true,
+    files: &[],
 };
 
 /// Dynamic-EQ de-esser: a high-pass sidechain detects sibilance and a high shelf at `freq`
@@ -490,6 +493,7 @@ pub static MAX_INFO: PluginInfo = PluginInfo {
     params: &MAX_PARAMS,
     is_instrument: false,
     audiosuite: true,
+    files: &[],
 };
 
 const MAX_LOOKAHEAD_MS: f32 = 1.5;

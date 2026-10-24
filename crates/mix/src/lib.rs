@@ -244,6 +244,9 @@ struct PluginSlot {
     applied: Vec<f32>,
     /// Last values pushed for automation lanes on parameters that are not stored, by lane index.
     applied_lanes: Vec<f32>,
+    /// Hash of each file parameter (id and path) last accepted by `set_file`, in the insert's
+    /// file-map order. A rejected file is not recorded, so it is offered again on the next block.
+    applied_files: Vec<u64>,
     failed: bool,
     /// The slot's main-thread service point, kept here when this engine owns its plugins (offline
     /// renders: `render` services them between blocks). A realtime host keeps the handles itself.
@@ -459,6 +462,7 @@ impl SlotCtx<'_> {
             plugin,
             applied: Vec::new(),
             applied_lanes: Vec::new(),
+            applied_files: Vec::new(),
             failed: false,
             service,
         })
@@ -1889,6 +1893,7 @@ fn apply_values(
             *last = val;
         }
     }
+    apply_files(slot, ins);
     let Some((lanes, slot_u8, pos)) = lanes else { return };
     if slot.applied_lanes.len() != lanes.len() {
         slot.applied_lanes = vec![f32::NAN; lanes.len()];
@@ -1902,6 +1907,24 @@ fn apply_values(
         if val.to_bits() != last.to_bits() {
             slot.plugin.set_param(param, val);
             *last = val;
+        }
+    }
+}
+
+/// Pushes the insert's file parameters to the plugin whenever the id or path changes. Hashes
+/// instead of comparing strings, so a steady block allocates nothing.
+fn apply_files(slot: &mut PluginSlot, ins: &soundcraft_model::Insert) {
+    use std::hash::{Hash, Hasher};
+    if slot.applied_files.len() != ins.files.len() {
+        slot.applied_files = vec![u64::MAX; ins.files.len()];
+    }
+    for ((k, path), last) in ins.files.iter().zip(slot.applied_files.iter_mut()) {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        k.hash(&mut h);
+        path.hash(&mut h);
+        let hash = h.finish();
+        if hash != *last && slot.plugin.set_file(k, path) {
+            *last = hash;
         }
     }
 }
@@ -3210,6 +3233,37 @@ mod tests {
         }
     }
 
+    /// A gain that records every `set_file` call it receives.
+    struct FileSpy {
+        inner: Box<dyn Plugin>,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    impl Plugin for FileSpy {
+        fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
+            self.inner.info()
+        }
+        fn prepare(&mut self, sr: f32, mb: usize, ch: usize) {
+            self.inner.prepare(sr, mb, ch);
+        }
+        fn reset(&mut self) {
+            self.inner.reset();
+        }
+        fn set_param(&mut self, id: &str, v: f32) -> bool {
+            self.inner.set_param(id, v)
+        }
+        fn param(&self, id: &str) -> Option<f32> {
+            self.inner.param(id)
+        }
+        fn set_file(&mut self, id: &str, path: &str) -> bool {
+            self.calls.lock().unwrap().push((id.to_string(), path.to_string()));
+            true
+        }
+        fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+            self.inner.process(io, frames);
+        }
+    }
+
     fn nan(s: &Session, track: TrackId, slot: usize, ch: usize) -> Vec<PreparedInstance> {
         vec![PreparedInstance {
             track,
@@ -3219,6 +3273,39 @@ mod tests {
             instance: tag(s, track, slot),
             plugin: Box::new(Nan(soundcraft_dsp::create("gain").unwrap())),
         }]
+    }
+
+    #[test]
+    fn file_parameters_reach_the_plugin_once_per_change_and_again_on_a_new_instance() {
+        let (mut s, a) = session_with_dc(0.5, 48_000);
+        let mut ins = Insert::new("clap:test.spy");
+        ins.files.insert("urn:test#model".into(), "/models/a.nam".into());
+        s.track_mut(a).unwrap().mixer.inserts[2] = Some(ins);
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let spy = |s: &Session, track, slot, ch| {
+            let plugin = Box::new(FileSpy { inner: soundcraft_dsp::create("gain").unwrap(), calls: calls.clone() });
+            vec![PreparedInstance { track, slot, id: "clap:test.spy".into(), ch, instance: tag(s, track, slot), plugin }]
+        };
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        eng.adopt(spy(&s, a, 2, 1));
+        render_block(&mut eng, &s, 0);
+        render_block(&mut eng, &s, 512);
+        render_block(&mut eng, &s, 1024);
+        let one = |p: &str| vec![("urn:test#model".to_string(), p.to_string())];
+        assert_eq!(*calls.lock().unwrap(), one("/models/a.nam"));
+        // A new path is sent once, and again only when it changes.
+        s.track_mut(a).unwrap().mixer.inserts[2].as_mut().unwrap().files.insert("urn:test#model".into(), "/models/b.nam".into());
+        render_block(&mut eng, &s, 1536);
+        render_block(&mut eng, &s, 2048);
+        let mut want = one("/models/a.nam");
+        want.extend(one("/models/b.nam"));
+        assert_eq!(*calls.lock().unwrap(), want);
+        // A new instance (a fresh slot) gets the file again.
+        eng.adopt(spy(&s, a, 2, 1));
+        render_block(&mut eng, &s, 2560);
+        assert_eq!(calls.lock().unwrap().len(), 3);
+        assert_eq!(calls.lock().unwrap()[2], ("urn:test#model".to_string(), "/models/b.nam".to_string()));
     }
 
     #[test]

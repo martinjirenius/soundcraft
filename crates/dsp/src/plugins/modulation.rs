@@ -33,6 +33,7 @@ pub static DELAY_INFO: PluginInfo = PluginInfo {
     params: &DELAY_PARAMS,
     is_instrument: false,
     audiosuite: true,
+    files: &[],
 };
 
 /// Feedback delay with modulation and a low-pass in the feedback path.
@@ -165,6 +166,7 @@ pub static CHORUS_INFO: PluginInfo = PluginInfo {
     params: &CHORUS_PARAMS,
     is_instrument: false,
     audiosuite: true,
+    files: &[],
 };
 
 static FLANGER_PARAMS: [ParamInfo; 5] = [
@@ -183,6 +185,7 @@ pub static FLANGER_INFO: PluginInfo = PluginInfo {
     params: &FLANGER_PARAMS,
     is_instrument: false,
     audiosuite: true,
+    files: &[],
 };
 
 #[derive(Clone, Copy, PartialEq)]
@@ -351,6 +354,7 @@ pub static PHASER_INFO: PluginInfo = PluginInfo {
     params: &PHASER_PARAMS,
     is_instrument: false,
     audiosuite: true,
+    files: &[],
 };
 
 /// Cascade of modulated first-order allpasses with feedback.

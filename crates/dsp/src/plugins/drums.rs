@@ -33,6 +33,7 @@ pub static DRUM_INFO: PluginInfo = PluginInfo {
     params: &DRUM_PARAMS,
     is_instrument: true,
     audiosuite: false,
+    files: &[],
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]

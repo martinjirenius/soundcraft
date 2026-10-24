@@ -21,6 +21,7 @@ soundcraft-clap-host = { path = "crates/clap-host" }
 soundcraft-vst3-host = { path = "crates/vst3-host" }
 soundcraft-au-host = { path = "crates/au-host" }
 soundcraft-lv2-host = { path = "crates/lv2-host" }
+soundcraft-x11-window = { path = "crates/x11-window" }
 soundcraft-model = { path = "crates/model" }
 soundcraft-mix = { path = "crates/mix" }
 soundcraft-engine = { path = "crates/engine" }

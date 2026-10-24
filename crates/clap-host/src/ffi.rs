@@ -2264,139 +2264,43 @@ mod hostwin {
     }
 }
 
-/// Linux and the other Unix hosts with X11 (not macOS or Android): a fixed-size top-level X11
-/// window (`WM_CLASS` "soundcraft") that the plugin parents its child window into. It talks to the
-/// X server over x11rb's pure-Rust connection, so no libxcb is needed. Each window owns its own
-/// connection, which `is_visible` drains for the window manager's close request.
+/// Linux and the other Unix hosts with X11 (not macOS or Android): the fixed-size top-level X11
+/// window lives in `soundcraft-x11-window`; this wraps it as the CLAP host's window.
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
 mod hostwin {
     use clap_sys::ext::gui::clap_window_handle;
-    use std::cell::Cell;
+    use soundcraft_x11_window::X11Window;
     use std::ffi::c_ulong;
-    use x11rb::COPY_FROM_PARENT;
-    use x11rb::connection::Connection;
-    use x11rb::properties::WmSizeHints;
-    use x11rb::protocol::Event;
-    use x11rb::protocol::xproto::{
-        Atom, AtomEnum, ConfigureWindowAux, ConnectionExt, CreateWindowAux, EventMask, PropMode, StackMode, Window, WindowClass,
-    };
-    use x11rb::rust_connection::RustConnection;
-    use x11rb::wrapper::ConnectionExt as _;
 
     pub const SUPPORTED: bool = true;
 
-    /// Largest side of a client area we ask for (the same bound as a plugin's size).
-    const MAX_SIDE: f64 = 16_384.0;
-
-    fn err(e: impl std::fmt::Display) -> String {
-        e.to_string()
-    }
-
-    /// A client-area side in pixels: at least 1, at most `MAX_SIDE`; 640 for a non-finite request.
-    fn side(v: f64) -> u16 {
-        if v.is_finite() { v.clamp(1.0, MAX_SIDE) as u16 } else { 640 }
-    }
-
-    fn atom(conn: &RustConnection, name: &[u8]) -> Result<Atom, String> {
-        Ok(conn.intern_atom(false, name).map_err(err)?.reply().map_err(err)?.atom)
-    }
-
-    /// Owns the connection and the window; the window is destroyed in `close` (which drops the
-    /// connection). Nothing here blocks: events are drained without waiting.
-    pub struct HostWindow {
-        conn: RustConnection,
-        win: Window,
-        /// `WM_PROTOCOLS` and `WM_DELETE_WINDOW`, which name the window manager's close request.
-        protocols: Atom,
-        delete: Atom,
-        /// The window manager asked to close the window or the connection failed: from then on
-        /// `is_visible` is false.
-        closed: Cell<bool>,
-    }
+    pub struct HostWindow(X11Window);
 
     impl HostWindow {
         pub fn new(title: &str, w: f64, h: f64) -> Result<HostWindow, String> {
-            let (conn, screen_num) = RustConnection::connect(None).map_err(|e| format!("no X11 display for plugin editors ({e})"))?;
-            let screen = conn.setup().roots.get(screen_num).ok_or("the X11 display has no screen")?;
-            let (root, visual, black) = (screen.root, screen.root_visual, screen.black_pixel);
-            let (ww, wh) = (side(w), side(h));
-            let protocols = atom(&conn, b"WM_PROTOCOLS")?;
-            let delete = atom(&conn, b"WM_DELETE_WINDOW")?;
-            let net_name = atom(&conn, b"_NET_WM_NAME")?;
-            let utf8 = atom(&conn, b"UTF8_STRING")?;
-            let win = conn.generate_id().map_err(err)?;
-            let aux = CreateWindowAux::new().background_pixel(black).event_mask(EventMask::STRUCTURE_NOTIFY);
-            conn.create_window(COPY_FROM_PARENT as u8, win, root, 0, 0, ww, wh, 0, WindowClass::INPUT_OUTPUT, visual, &aux).map_err(err)?;
-            // Fixed size, like the Windows host window.
-            let mut hints = WmSizeHints::new();
-            hints.min_size = Some((i32::from(ww), i32::from(wh)));
-            hints.max_size = Some((i32::from(ww), i32::from(wh)));
-            hints.set_normal_hints(&conn, win).map_err(err)?;
-            conn.change_property8(PropMode::REPLACE, win, AtomEnum::WM_NAME, AtomEnum::STRING, title.as_bytes()).map_err(err)?;
-            conn.change_property8(PropMode::REPLACE, win, net_name, utf8, title.as_bytes()).map_err(err)?;
-            conn.change_property8(PropMode::REPLACE, win, AtomEnum::WM_CLASS, AtomEnum::STRING, b"soundcraft\0soundcraft\0").map_err(err)?;
-            conn.change_property32(PropMode::REPLACE, win, protocols, AtomEnum::ATOM, &[delete]).map_err(err)?;
-            conn.map_window(win).map_err(err)?;
-            conn.flush().map_err(err)?;
-            Ok(HostWindow { conn, win, protocols, delete, closed: Cell::new(false) })
+            X11Window::new(title, w, h).map(HostWindow)
         }
 
         /// The X11 window the plugin creates its child window in (for `set_parent`).
         pub fn handle(&self) -> clap_window_handle {
-            clap_window_handle { x11: c_ulong::from(self.win) }
+            clap_window_handle { x11: c_ulong::from(self.0.id()) }
         }
 
         pub fn raise(&self) {
-            if self.closed.get() {
-                return;
-            }
-            let _ = self.conn.map_window(self.win);
-            let _ = self.conn.configure_window(self.win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
-            let _ = self.conn.flush();
+            self.0.raise();
         }
 
-        /// Drains pending events without blocking. False once the window manager asked to close
-        /// the window (`WM_DELETE_WINDOW`) or the connection failed, and for good after that.
+        /// False once the window manager asked to close the window (see `X11Window::is_visible`).
         pub fn is_visible(&self) -> bool {
-            if self.closed.get() {
-                return false;
-            }
-            loop {
-                match self.conn.poll_for_event() {
-                    Ok(Some(Event::ClientMessage(ev))) => {
-                        if ev.type_ == self.protocols && ev.data.as_data32().first() == Some(&self.delete) {
-                            self.closed.set(true);
-                            return false;
-                        }
-                    }
-                    Ok(Some(_)) => {}
-                    Ok(None) => return true,
-                    Err(_) => {
-                        self.closed.set(true);
-                        return false;
-                    }
-                }
-            }
+            self.0.is_visible()
         }
 
-        /// Resizes the client area and keeps it fixed at the new size.
         pub fn resize(&self, w: f64, h: f64) {
-            if self.closed.get() {
-                return;
-            }
-            let (ww, wh) = (side(w), side(h));
-            let mut hints = WmSizeHints::new();
-            hints.min_size = Some((i32::from(ww), i32::from(wh)));
-            hints.max_size = Some((i32::from(ww), i32::from(wh)));
-            let _ = self.conn.configure_window(self.win, &ConfigureWindowAux::new().width(u32::from(ww)).height(u32::from(wh)));
-            let _ = hints.set_normal_hints(&self.conn, self.win);
-            let _ = self.conn.flush();
+            self.0.resize(w, h);
         }
 
-        /// Destroys the window and closes the connection.
         pub fn close(self) {
-            let _ = self.conn.destroy_window(self.win);
-            let _ = self.conn.flush();
+            self.0.close();
         }
     }
 }

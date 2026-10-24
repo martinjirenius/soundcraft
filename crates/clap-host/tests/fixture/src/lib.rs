@@ -40,7 +40,10 @@
 //!
 //! The gain plugin also implements `clap.state` (gain and mode as two little-endian f64s) and a
 //! floating-only `clap.gui` without a real window: showing it "edits" the gain to 0.25 in the GUI,
-//! reported as an output parameter event by the next `process`.
+//! reported as an output parameter event by the next `process`. Creating the GUI registers a 1 ms
+//! `clap.timer-support` timer and the read end of a pipe (one byte written) with `clap.posix-fd-support`;
+//! once the host has called `on_timer` and `on_fd` (READ) on the main thread, the next `process`
+//! reports a gain edit to 0.5 (once). Destroying the GUI unregisters both and closes the pipe.
 #![allow(clippy::missing_safety_doc, non_upper_case_globals)]
 
 use clap_sys::audio_buffer::clap_audio_buffer;
@@ -49,7 +52,9 @@ use clap_sys::events::*;
 use clap_sys::ext::audio_ports::*;
 use clap_sys::ext::gui::*;
 use clap_sys::ext::state::*;
+use clap_sys::ext::posix_fd_support::*;
 use clap_sys::ext::thread_check::*;
+use clap_sys::ext::timer_support::*;
 use clap_sys::stream::*;
 use clap_sys::ext::latency::*;
 use clap_sys::ext::log::*;
@@ -62,6 +67,8 @@ use clap_sys::plugin::*;
 use clap_sys::process::*;
 use clap_sys::version::CLAP_VERSION;
 use std::ffi::{CStr, c_char, c_void};
+use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::ThreadId;
 
@@ -152,6 +159,15 @@ struct Fx {
     /// What `clap.thread-check` answered (see the module docs); 0 = not asked yet.
     asked_main: f64,
     asked_process: f64,
+    /// The timer the GUI registered (`gui_create`), and whether the host has called `on_timer`.
+    timer_id: clap_id,
+    timer_fired: bool,
+    /// The GUI's pipe (read end registered with the host, write end kept open), and whether the
+    /// host has called `on_fd` with READ for it.
+    pipe: Option<(std::io::PipeReader, std::io::PipeWriter)>,
+    fd_read: bool,
+    /// The timer-and-fd gain edit (0.5) went out.
+    timer_edit_sent: bool,
 }
 
 /// Asks the host's `clap.thread-check` from the calling thread.
@@ -462,6 +478,28 @@ unsafe fn process_block(p: *const clap_plugin, pr: *const clap_process) -> clap_
         };
         assert!(unsafe { (out.try_push.unwrap())(pr.out_events, &note.header) });
     }
+    if f.timer_fired && f.fd_read && !f.timer_edit_sent {
+        f.timer_edit_sent = true;
+        f.gain = 0.5;
+        let e = clap_event_param_value {
+            header: clap_event_header {
+                size: std::mem::size_of::<clap_event_param_value>() as u32,
+                time: 0,
+                space_id: CLAP_CORE_EVENT_SPACE_ID,
+                type_: CLAP_EVENT_PARAM_VALUE,
+                flags: 0,
+            },
+            param_id: 7,
+            cookie: std::ptr::null_mut(),
+            note_id: -1,
+            port_index: -1,
+            channel: -1,
+            key: -1,
+            value: 0.5,
+        };
+        let out = unsafe { &*pr.out_events };
+        assert!(unsafe { (out.try_push.unwrap())(pr.out_events, &e.header) });
+    }
     let mut next = 0u32;
     let mut last_time = 0u32;
     for i in 0..n {
@@ -724,6 +762,17 @@ unsafe extern "C" fn gui_create(p: *const clap_plugin, _api: *const c_char, floa
     let f = unsafe { fx(p) };
     assert!(floating && !f.gui_created, "create");
     f.gui_created = true;
+    // A timer and a readable pipe, serviced by the host on the main thread.
+    let host = unsafe { &*f.host };
+    let timers = unsafe { (host.get_extension.unwrap())(f.host, CLAP_EXT_TIMER_SUPPORT.as_ptr()) } as *const clap_host_timer_support;
+    let timers = unsafe { timers.as_ref() }.expect("host timer extension");
+    assert!(unsafe { (timers.register_timer.unwrap())(f.host, 1, &mut f.timer_id) }, "register_timer");
+    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    writer.write_all(&[1]).expect("pipe write");
+    let fds = unsafe { (host.get_extension.unwrap())(f.host, CLAP_EXT_POSIX_FD_SUPPORT.as_ptr()) } as *const clap_host_posix_fd_support;
+    let fds = unsafe { fds.as_ref() }.expect("host posix-fd extension");
+    assert!(unsafe { (fds.register_fd.unwrap())(f.host, reader.as_raw_fd(), CLAP_POSIX_FD_READ) }, "register_fd");
+    f.pipe = Some((reader, writer));
     true
 }
 
@@ -732,6 +781,14 @@ unsafe extern "C" fn gui_destroy(p: *const clap_plugin) {
     assert!(f.gui_created, "destroy without create");
     f.gui_created = false;
     f.gui_visible = false;
+    let host = unsafe { &*f.host };
+    let timers = unsafe { (host.get_extension.unwrap())(f.host, CLAP_EXT_TIMER_SUPPORT.as_ptr()) } as *const clap_host_timer_support;
+    assert!(unsafe { ((*timers).unregister_timer.unwrap())(f.host, f.timer_id) }, "unregister_timer");
+    if let Some((reader, _writer)) = f.pipe.take() {
+        let fds = unsafe { (host.get_extension.unwrap())(f.host, CLAP_EXT_POSIX_FD_SUPPORT.as_ptr()) } as *const clap_host_posix_fd_support;
+        assert!(unsafe { ((*fds).unregister_fd.unwrap())(f.host, reader.as_raw_fd()) }, "unregister_fd");
+        // `reader` and `_writer` close here.
+    }
 }
 
 unsafe extern "C" fn gui_set_scale(_p: *const clap_plugin, scale: f64) -> bool {
@@ -779,6 +836,25 @@ static GUI: clap_plugin_gui = clap_plugin_gui {
     hide: Some(gui_hide),
 };
 
+unsafe extern "C" fn on_timer(p: *const clap_plugin, timer_id: clap_id) {
+    let f = unsafe { fx(p) };
+    on_main(f, "on_timer");
+    assert_eq!(timer_id, f.timer_id, "the timer the GUI registered");
+    f.timer_fired = true;
+}
+
+unsafe extern "C" fn on_fd(p: *const clap_plugin, fd: i32, flags: clap_posix_fd_flags) {
+    let f = unsafe { fx(p) };
+    on_main(f, "on_fd");
+    assert!(f.pipe.as_ref().is_some_and(|(r, _)| r.as_raw_fd() == fd), "the pipe the GUI registered");
+    if flags & CLAP_POSIX_FD_READ != 0 {
+        f.fd_read = true;
+    }
+}
+
+static TIMER: clap_plugin_timer_support = clap_plugin_timer_support { on_timer: Some(on_timer) };
+static POSIX_FD: clap_plugin_posix_fd_support = clap_plugin_posix_fd_support { on_fd: Some(on_fd) };
+
 unsafe extern "C" fn get_extension(p: *const clap_plugin, id: *const c_char) -> *const c_void {
     let id = unsafe { CStr::from_ptr(id) };
     let synth = unsafe { fx(p) }.synth;
@@ -794,6 +870,10 @@ unsafe extern "C" fn get_extension(p: *const clap_plugin, id: *const c_char) -> 
         &STATE as *const _ as *const c_void
     } else if id == CLAP_EXT_GUI && !synth {
         &GUI as *const _ as *const c_void
+    } else if id == CLAP_EXT_TIMER_SUPPORT && !synth {
+        &TIMER as *const _ as *const c_void
+    } else if id == CLAP_EXT_POSIX_FD_SUPPORT && !synth {
+        &POSIX_FD as *const _ as *const c_void
     } else {
         std::ptr::null()
     }
@@ -881,6 +961,11 @@ unsafe extern "C" fn factory_create(_f: *const clap_plugin_factory, host: *const
         flush_edit: false,
         asked_main: 0.0,
         asked_process: 0.0,
+        timer_id: 0,
+        timer_fired: false,
+        pipe: None,
+        fd_read: false,
+        timer_edit_sent: false,
     });
     let raw = Box::into_raw(b);
     unsafe {

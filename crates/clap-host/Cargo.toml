@@ -21,6 +21,15 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphic
 name = "editor_main_thread"
 harness = false
 
+# `poll(2)` for `clap.posix-fd-support` (every Unix host).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# The Linux/BSD host window for embedded editors: a top-level X11 window over x11rb's pure-Rust
+# connection (no libxcb).
+[target.'cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))'.dependencies]
+x11rb = { version = "0.13", default-features = false }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 clap-sys = "0.5"
 libloading = "0.8"

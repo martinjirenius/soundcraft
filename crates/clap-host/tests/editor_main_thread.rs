@@ -29,6 +29,12 @@ fn main() {
     assert!((io[0][10] - 0.25).abs() < 1e-6, "{}", io[0][10]);
     assert_eq!(ed.idle(), vec![("7".to_string(), 0.25)]);
     assert!(ed.idle().is_empty(), "drained");
+    // The GUI's timer and pipe are serviced by idle on the main thread: once both have fired, the
+    // next block reports the gain edit to 0.5.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    assert!(ed.idle().is_empty());
+    block(&mut p);
+    assert_eq!(ed.idle(), vec![("7".to_string(), 0.5)]);
     ed.close();
     assert!(!ed.is_open());
     // Through the Plugin trait as well.

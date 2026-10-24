@@ -20,7 +20,7 @@ use clap_sys::events::{
     clap_event_transport, clap_input_events, clap_output_events,
 };
 use clap_sys::ext::audio_ports::{CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, clap_audio_port_info, clap_plugin_audio_ports};
-use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_host_gui, clap_plugin_gui, clap_window, clap_window_handle};
+use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_host_gui, clap_plugin_gui, clap_window};
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_host_latency, clap_plugin_latency};
 use clap_sys::ext::log::{CLAP_EXT_LOG, CLAP_LOG_ERROR, CLAP_LOG_FATAL, CLAP_LOG_WARNING, clap_host_log, clap_log_severity};
 use clap_sys::ext::note_ports::{CLAP_EXT_NOTE_PORTS, clap_note_port_info, clap_plugin_note_ports};
@@ -28,8 +28,13 @@ use clap_sys::ext::params::{
     CLAP_EXT_PARAMS, CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_INFO, clap_host_params, clap_param_clear_flags, clap_param_info,
     clap_param_rescan_flags, clap_plugin_params,
 };
+use clap_sys::ext::posix_fd_support::{
+    CLAP_EXT_POSIX_FD_SUPPORT, CLAP_POSIX_FD_ERROR, CLAP_POSIX_FD_READ, CLAP_POSIX_FD_WRITE, clap_host_posix_fd_support,
+    clap_plugin_posix_fd_support, clap_posix_fd_flags,
+};
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state, clap_plugin_state};
 use clap_sys::ext::thread_check::{CLAP_EXT_THREAD_CHECK, clap_host_thread_check};
+use clap_sys::ext::timer_support::{CLAP_EXT_TIMER_SUPPORT, clap_host_timer_support, clap_plugin_timer_support};
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
 use clap_sys::fixedpoint::{CLAP_BEATTIME_FACTOR, CLAP_SECTIME_FACTOR};
 use clap_sys::host::clap_host;
@@ -45,7 +50,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Most plugins one factory may report (hostile-input cap).
 const MAX_PLUGINS_PER_FACTORY: u32 = 1024;
@@ -284,10 +289,14 @@ impl Bundle {
         inst.notes = inst.extension::<clap_plugin_note_ports>(CLAP_EXT_NOTE_PORTS);
         inst.state_ext = inst.extension::<clap_plugin_state>(CLAP_EXT_STATE);
         let gui = inst.extension::<clap_plugin_gui>(CLAP_EXT_GUI);
+        let timer = inst.extension::<clap_plugin_timer_support>(CLAP_EXT_TIMER_SUPPORT);
+        let posix_fd = inst.extension::<clap_plugin_posix_fd_support>(CLAP_EXT_POSIX_FD_SUPPORT);
         inst.gui = Arc::new(GuiLink {
             inner: Mutex::new(GuiInner {
                 plugin,
                 gui,
+                timer,
+                posix_fd,
                 state: inst.state_ext,
                 params: inst.params,
                 ports: inst.ports,
@@ -316,6 +325,19 @@ impl Drop for Bundle {
 }
 
 // ---- host side -----------------------------------------------------------------------------
+
+/// Most `clap.timer-support` timers one instance may register.
+const TIMER_CAP: usize = 64;
+/// Most `clap.posix-fd-support` watches one instance may register.
+const FD_CAP: usize = 64;
+
+/// A `clap.timer-support` timer: its id, its period, and when it is next due.
+#[derive(Clone, Copy)]
+pub(crate) struct Timer {
+    id: clap_id,
+    period: Duration,
+    due: Instant,
+}
 
 /// Flags the plugin raises through the host callbacks (any thread).
 pub(crate) struct HostState {
@@ -369,6 +391,12 @@ pub(crate) struct HostState {
     pub edits: Mutex<Vec<(u32, f64)>>,
     /// [`thread_token`] of the thread that created the instance (0 = not recorded).
     pub main_thread: AtomicU64,
+    /// `clap.timer-support` timers the plugin registered (at most [`TIMER_CAP`]).
+    pub timers: Mutex<Vec<Timer>>,
+    /// The id the next `register_timer` hands out.
+    pub next_timer: AtomicU32,
+    /// `clap.posix-fd-support` watches the plugin registered (at most [`FD_CAP`]): fd and flags.
+    pub fds: Mutex<Vec<(i32, u32)>>,
 }
 
 thread_local! {
@@ -435,6 +463,9 @@ impl Default for HostState {
             gui_resize: AtomicU64::new(0),
             edits: Mutex::new(Vec::with_capacity(EDIT_CAP)),
             main_thread: AtomicU64::new(0),
+            timers: Mutex::new(Vec::new()),
+            next_timer: AtomicU32::new(1),
+            fds: Mutex::new(Vec::new()),
         }
     }
 }
@@ -573,6 +604,162 @@ static HOST_PARAMS: clap_host_params =
 static HOST_THREAD_CHECK: clap_host_thread_check =
     clap_host_thread_check { is_main_thread: Some(host_is_main_thread), is_audio_thread: Some(host_is_audio_thread) };
 static HOST_LATENCY: clap_host_latency = clap_host_latency { changed: Some(host_latency_changed) };
+static HOST_TIMER: clap_host_timer_support =
+    clap_host_timer_support { register_timer: Some(host_register_timer), unregister_timer: Some(host_unregister_timer) };
+static HOST_POSIX_FD: clap_host_posix_fd_support =
+    clap_host_posix_fd_support { register_fd: Some(host_register_fd), modify_fd: Some(host_modify_fd), unregister_fd: Some(host_unregister_fd) };
+
+/// The time `period` after `now` (`now` itself if that overflows).
+fn due_after(now: Instant, period: Duration) -> Instant {
+    now.checked_add(period).unwrap_or(now)
+}
+
+/// `clap.timer-support`: the plugin asks for `on_timer` every `period_ms`, on the main thread.
+/// Touches only the timer list, never the editor link.
+unsafe extern "C" fn host_register_timer(host: *const clap_host, period_ms: u32, timer_id: *mut clap_id) -> bool {
+    // SAFETY: the plugin passes back the host pointer we gave it.
+    let Some(s) = (unsafe { state(host) }) else { return false };
+    if timer_id.is_null() {
+        return false;
+    }
+    let mut timers = s.timers.lock().unwrap_or_else(PoisonError::into_inner);
+    if timers.len() >= TIMER_CAP {
+        return false;
+    }
+    let id = s.next_timer.fetch_add(1, Ordering::Relaxed);
+    let period = Duration::from_millis(u64::from(period_ms.max(1)));
+    timers.push(Timer { id, period, due: due_after(Instant::now(), period) });
+    // SAFETY: the plugin gave a non-null pointer to a writable `clap_id` (CLAP contract).
+    unsafe { *timer_id = id };
+    true
+}
+
+/// `clap.timer-support`: the plugin drops a timer it registered.
+unsafe extern "C" fn host_unregister_timer(host: *const clap_host, timer_id: clap_id) -> bool {
+    // SAFETY: the plugin passes back the host pointer we gave it.
+    let Some(s) = (unsafe { state(host) }) else { return false };
+    let mut timers = s.timers.lock().unwrap_or_else(PoisonError::into_inner);
+    let before = timers.len();
+    timers.retain(|t| t.id != timer_id);
+    timers.len() != before
+}
+
+/// `clap.posix-fd-support`: the plugin watches `fd` for `flags`, serviced on the main thread.
+unsafe extern "C" fn host_register_fd(host: *const clap_host, fd: i32, flags: clap_posix_fd_flags) -> bool {
+    // SAFETY: the plugin passes back the host pointer we gave it.
+    let Some(s) = (unsafe { state(host) }) else { return false };
+    let mut fds = s.fds.lock().unwrap_or_else(PoisonError::into_inner);
+    if fd < 0 || fds.len() >= FD_CAP || fds.iter().any(|&(f, _)| f == fd) {
+        return false;
+    }
+    fds.push((fd, flags));
+    true
+}
+
+/// `clap.posix-fd-support`: the plugin changes the flags of a watch it registered.
+unsafe extern "C" fn host_modify_fd(host: *const clap_host, fd: i32, flags: clap_posix_fd_flags) -> bool {
+    // SAFETY: the plugin passes back the host pointer we gave it.
+    let Some(s) = (unsafe { state(host) }) else { return false };
+    let mut fds = s.fds.lock().unwrap_or_else(PoisonError::into_inner);
+    match fds.iter_mut().find(|(f, _)| *f == fd) {
+        Some(watch) => {
+            watch.1 = flags;
+            true
+        }
+        None => false,
+    }
+}
+
+/// `clap.posix-fd-support`: the plugin drops a watch it registered.
+unsafe extern "C" fn host_unregister_fd(host: *const clap_host, fd: i32) -> bool {
+    // SAFETY: the plugin passes back the host pointer we gave it.
+    let Some(s) = (unsafe { state(host) }) else { return false };
+    let mut fds = s.fds.lock().unwrap_or_else(PoisonError::into_inner);
+    let before = fds.len();
+    fds.retain(|&(f, _)| f != fd);
+    fds.len() != before
+}
+
+/// Services the plugin's timers and fds on the main thread. Called by `GuiLink::idle` while the
+/// plugin is alive, with the editor link locked. The lists are copied out under their mutexes and
+/// those are released before the plugin is called: a callback may register or unregister.
+fn service_timers_and_fds(host: &HostState, g: &GuiInner) {
+    // SAFETY: the extension pointers are null or static vtables in the plugin, valid while `alive`.
+    if let Some(on_timer) = unsafe { g.timer.as_ref() }.and_then(|t| t.on_timer) {
+        let now = Instant::now();
+        let due: Vec<clap_id> = {
+            let mut timers = host.timers.lock().unwrap_or_else(PoisonError::into_inner);
+            timers
+                .iter_mut()
+                .filter(|t| t.due <= now)
+                .map(|t| {
+                    t.due = due_after(now, t.period);
+                    t.id
+                })
+                .collect()
+        };
+        for id in due {
+            // A callback may have unregistered a timer that is still on the copied list.
+            let live = host.timers.lock().unwrap_or_else(PoisonError::into_inner).iter().any(|t| t.id == id);
+            if live {
+                // SAFETY: live plugin, main thread; `id` is a timer it registered.
+                unsafe { on_timer(g.plugin, id) };
+            }
+        }
+    }
+    service_fds(host, g);
+}
+
+/// `clap.posix-fd-support`: polls the watched fds without blocking and calls `on_fd` for each one
+/// with events (read, write, or error).
+#[cfg(unix)]
+fn service_fds(host: &HostState, g: &GuiInner) {
+    // SAFETY: as in `service_timers_and_fds`.
+    let Some(on_fd) = (unsafe { g.posix_fd.as_ref() }).and_then(|p| p.on_fd) else { return };
+    let watches: Vec<(i32, u32)> = host.fds.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    if watches.is_empty() {
+        return;
+    }
+    let mut pfds: Vec<libc::pollfd> = watches
+        .iter()
+        .map(|&(fd, flags)| {
+            let mut events: libc::c_short = 0;
+            if flags & CLAP_POSIX_FD_READ != 0 {
+                events |= libc::POLLIN;
+            }
+            if flags & CLAP_POSIX_FD_WRITE != 0 {
+                events |= libc::POLLOUT;
+            }
+            libc::pollfd { fd, events, revents: 0 }
+        })
+        .collect();
+    // SAFETY: `pfds` is a valid, writable array of `pfds.len()` pollfd structs; a zero timeout never blocks.
+    let ready = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 0) };
+    if ready <= 0 {
+        return;
+    }
+    for p in pfds.iter().filter(|p| p.revents != 0) {
+        let still = host.fds.lock().unwrap_or_else(PoisonError::into_inner).iter().any(|&(f, _)| f == p.fd);
+        if !still {
+            continue;
+        }
+        let mut flags = 0;
+        if p.revents & libc::POLLIN != 0 {
+            flags |= CLAP_POSIX_FD_READ;
+        }
+        if p.revents & libc::POLLOUT != 0 {
+            flags |= CLAP_POSIX_FD_WRITE;
+        }
+        if p.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            flags |= CLAP_POSIX_FD_ERROR;
+        }
+        // SAFETY: live plugin, main thread; `p.fd` is a watch it registered and still holds.
+        unsafe { on_fd(g.plugin, p.fd, flags) };
+    }
+}
+
+#[cfg(not(unix))]
+fn service_fds(_host: &HostState, _g: &GuiInner) {}
 
 /// `clap.thread-check`: the thread that created the instance. Never allocates or locks.
 unsafe extern "C" fn host_is_main_thread(host: *const clap_host) -> bool {
@@ -605,8 +792,12 @@ unsafe extern "C" fn host_get_extension(_host: *const clap_host, id: *const c_ch
         (&HOST_GUI as *const clap_host_gui).cast()
     } else if id == CLAP_EXT_THREAD_CHECK {
         (&HOST_THREAD_CHECK as *const clap_host_thread_check).cast()
+    } else if id == CLAP_EXT_TIMER_SUPPORT {
+        (&HOST_TIMER as *const clap_host_timer_support).cast()
+    } else if cfg!(unix) && id == CLAP_EXT_POSIX_FD_SUPPORT {
+        (&HOST_POSIX_FD as *const clap_host_posix_fd_support).cast()
     } else {
-        // Everything else (timers, fd support, …) is unsupported: CLAP allows null.
+        // Everything else is unsupported: CLAP allows null.
         std::ptr::null()
     }
 }
@@ -881,6 +1072,9 @@ fn window_api() -> Option<&'static CStr> {
 struct GuiInner {
     plugin: *const clap_plugin,
     gui: *const clap_plugin_gui,
+    /// The plugin's `clap.timer-support` and `clap.posix-fd-support` vtables (null without them).
+    timer: *const clap_plugin_timer_support,
+    posix_fd: *const clap_plugin_posix_fd_support,
     state: *const clap_plugin_state,
     params: *const clap_plugin_params,
     ports: *const clap_plugin_audio_ports,
@@ -921,6 +1115,8 @@ impl Default for GuiLink {
             inner: Mutex::new(GuiInner {
                 plugin: std::ptr::null(),
                 gui: std::ptr::null(),
+                timer: std::ptr::null(),
+                posix_fd: std::ptr::null(),
                 state: std::ptr::null(),
                 params: std::ptr::null(),
                 ports: std::ptr::null(),
@@ -980,7 +1176,7 @@ impl GuiLink {
             if hostwin::SUPPORTED && unsafe { supported(g.plugin, api.as_ptr(), false) } {
                 return self.open_embedded(&mut g, vt, api, title);
             }
-            return Err("this plugin offers only an embedded editor, which SoundCraft hosts on Windows only".into());
+            return Err("this plugin offers only an embedded editor, which SoundCraft cannot host on this platform".into());
         }
         self.host.gui_closed.store(false, Ordering::Relaxed);
         self.host.gui_destroyed.store(false, Ordering::Relaxed);
@@ -1042,7 +1238,7 @@ impl GuiLink {
                 return Err(e);
             }
         };
-        let parent = clap_window { api: api.as_ptr(), specific: clap_window_handle { win32: win.parent() } };
+        let parent = clap_window { api: api.as_ptr(), specific: win.handle() };
         // SAFETY: live plugin with a created embedded GUI; `parent` names our live window and
         // outlives the call.
         if !unsafe { set_parent(g.plugin, &parent) } {
@@ -1051,14 +1247,13 @@ impl GuiLink {
             return Err("the editor could not attach to its window".into());
         }
         g.window = Some(win);
-        let shown = match vt.show {
+        // An embedded editor is visible once it is parented in our window, whatever `show` answers:
+        // some JUCE plugins (Odin2 on Linux) return false yet draw. The window shows what happened.
+        if let Some(f) = vt.show
             // SAFETY: live plugin with a created, parented GUI.
-            Some(f) => unsafe { f(g.plugin) },
-            None => true,
-        };
-        if !shown {
-            GuiLink::destroy(g);
-            return Err("the plugin could not show its editor".into());
+            && !unsafe { f(g.plugin) }
+        {
+            log::warn!("{title}: the plugin's editor reported that show failed; keeping its window open");
         }
         if let Some(win) = &g.window {
             win.raise();
@@ -1128,13 +1323,14 @@ impl GuiLink {
                 unsafe { f(g.plugin) };
             }
         }
+        service_timers_and_fds(&self.host, &g);
         if g.created {
             let resize = self.host.gui_resize.swap(0, Ordering::Relaxed);
             if resize != 0
                 && let Some(win) = &g.window
             {
                 let (w, h) = ((resize >> 32) as u32, resize as u32);
-                hostwin::resize(win.raw(), f64::from(w), f64::from(h));
+                win.resize(f64::from(w), f64::from(h));
                 if let Some(f) = GuiLink::vt(&g).and_then(|v| v.set_size) {
                     // SAFETY: live plugin with a created embedded GUI, main thread.
                     unsafe { f(g.plugin, w, h) };
@@ -1907,7 +2103,7 @@ impl Drop for Instance {
 /// Messages are dispatched by the app's own event loop on the main thread.
 #[cfg(windows)]
 mod hostwin {
-    use std::ffi::c_void;
+    use clap_sys::ext::gui::clap_window_handle;
     use std::sync::OnceLock;
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -2027,14 +2223,9 @@ mod hostwin {
             Ok(HostWindow { hwnd })
         }
 
-        /// The window handle (for resizes).
-        pub fn raw(&self) -> *mut c_void {
-            self.hwnd
-        }
-
-        /// The `HWND` the plugin creates its child window in.
-        pub fn parent(&self) -> *mut c_void {
-            self.live().unwrap_or(std::ptr::null_mut())
+        /// The parent the plugin creates its child window in (for `set_parent`).
+        pub fn handle(&self) -> clap_window_handle {
+            clap_window_handle { win32: self.live().unwrap_or(std::ptr::null_mut()) }
         }
 
         pub fn raise(&self) {
@@ -2060,24 +2251,161 @@ mod hostwin {
         }
     }
 
-    /// Resizes a host window's client area (`window` from [`HostWindow::raw`]); main thread only.
-    pub fn resize(window: *mut c_void, w: f64, h: f64) {
-        // SAFETY: `IsWindow` accepts any value.
-        if !on_main_thread() || window.is_null() || unsafe { IsWindow(window) } == 0 {
-            return;
+    impl HostWindow {
+        /// Resizes the client area; main thread only.
+        pub fn resize(&self, w: f64, h: f64) {
+            let Some(window) = self.live() else { return };
+            // SAFETY: a live window of this thread; style values are read, not changed.
+            let (style, ex) = unsafe { (GetWindowLongPtrW(window, GWL_STYLE) as u32, GetWindowLongPtrW(window, GWL_EXSTYLE) as u32) };
+            let (ow, oh) = outer_size(style, ex, w, h);
+            // SAFETY: as above; only the size changes.
+            unsafe { SetWindowPos(window, std::ptr::null_mut(), 0, 0, ow, oh, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) };
         }
-        // SAFETY: a live window of this thread; style values are read, not changed.
-        let (style, ex) = unsafe { (GetWindowLongPtrW(window, GWL_STYLE) as u32, GetWindowLongPtrW(window, GWL_EXSTYLE) as u32) };
-        let (ow, oh) = outer_size(style, ex, w, h);
-        // SAFETY: as above; only the size changes.
-        unsafe { SetWindowPos(window, std::ptr::null_mut(), 0, 0, ow, oh, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) };
     }
 }
 
-/// Other platforms: embedded editors are not hosted (floating ones still are).
-#[cfg(not(windows))]
+/// Linux and the other Unix hosts with X11 (not macOS or Android): a fixed-size top-level X11
+/// window (`WM_CLASS` "soundcraft") that the plugin parents its child window into. It talks to the
+/// X server over x11rb's pure-Rust connection, so no libxcb is needed. Each window owns its own
+/// connection, which `is_visible` drains for the window manager's close request.
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
 mod hostwin {
-    use std::ffi::c_void;
+    use clap_sys::ext::gui::clap_window_handle;
+    use std::cell::Cell;
+    use std::ffi::c_ulong;
+    use x11rb::COPY_FROM_PARENT;
+    use x11rb::connection::Connection;
+    use x11rb::properties::WmSizeHints;
+    use x11rb::protocol::Event;
+    use x11rb::protocol::xproto::{
+        Atom, AtomEnum, ConfigureWindowAux, ConnectionExt, CreateWindowAux, EventMask, PropMode, StackMode, Window, WindowClass,
+    };
+    use x11rb::rust_connection::RustConnection;
+    use x11rb::wrapper::ConnectionExt as _;
+
+    pub const SUPPORTED: bool = true;
+
+    /// Largest side of a client area we ask for (the same bound as a plugin's size).
+    const MAX_SIDE: f64 = 16_384.0;
+
+    fn err(e: impl std::fmt::Display) -> String {
+        e.to_string()
+    }
+
+    /// A client-area side in pixels: at least 1, at most `MAX_SIDE`; 640 for a non-finite request.
+    fn side(v: f64) -> u16 {
+        if v.is_finite() { v.clamp(1.0, MAX_SIDE) as u16 } else { 640 }
+    }
+
+    fn atom(conn: &RustConnection, name: &[u8]) -> Result<Atom, String> {
+        Ok(conn.intern_atom(false, name).map_err(err)?.reply().map_err(err)?.atom)
+    }
+
+    /// Owns the connection and the window; the window is destroyed in `close` (which drops the
+    /// connection). Nothing here blocks: events are drained without waiting.
+    pub struct HostWindow {
+        conn: RustConnection,
+        win: Window,
+        /// `WM_PROTOCOLS` and `WM_DELETE_WINDOW`, which name the window manager's close request.
+        protocols: Atom,
+        delete: Atom,
+        /// The window manager asked to close the window or the connection failed: from then on
+        /// `is_visible` is false.
+        closed: Cell<bool>,
+    }
+
+    impl HostWindow {
+        pub fn new(title: &str, w: f64, h: f64) -> Result<HostWindow, String> {
+            let (conn, screen_num) = RustConnection::connect(None).map_err(|e| format!("no X11 display for plugin editors ({e})"))?;
+            let screen = conn.setup().roots.get(screen_num).ok_or("the X11 display has no screen")?;
+            let (root, visual, black) = (screen.root, screen.root_visual, screen.black_pixel);
+            let (ww, wh) = (side(w), side(h));
+            let protocols = atom(&conn, b"WM_PROTOCOLS")?;
+            let delete = atom(&conn, b"WM_DELETE_WINDOW")?;
+            let net_name = atom(&conn, b"_NET_WM_NAME")?;
+            let utf8 = atom(&conn, b"UTF8_STRING")?;
+            let win = conn.generate_id().map_err(err)?;
+            let aux = CreateWindowAux::new().background_pixel(black).event_mask(EventMask::STRUCTURE_NOTIFY);
+            conn.create_window(COPY_FROM_PARENT as u8, win, root, 0, 0, ww, wh, 0, WindowClass::INPUT_OUTPUT, visual, &aux).map_err(err)?;
+            // Fixed size, like the Windows host window.
+            let mut hints = WmSizeHints::new();
+            hints.min_size = Some((i32::from(ww), i32::from(wh)));
+            hints.max_size = Some((i32::from(ww), i32::from(wh)));
+            hints.set_normal_hints(&conn, win).map_err(err)?;
+            conn.change_property8(PropMode::REPLACE, win, AtomEnum::WM_NAME, AtomEnum::STRING, title.as_bytes()).map_err(err)?;
+            conn.change_property8(PropMode::REPLACE, win, net_name, utf8, title.as_bytes()).map_err(err)?;
+            conn.change_property8(PropMode::REPLACE, win, AtomEnum::WM_CLASS, AtomEnum::STRING, b"soundcraft\0soundcraft\0").map_err(err)?;
+            conn.change_property32(PropMode::REPLACE, win, protocols, AtomEnum::ATOM, &[delete]).map_err(err)?;
+            conn.map_window(win).map_err(err)?;
+            conn.flush().map_err(err)?;
+            Ok(HostWindow { conn, win, protocols, delete, closed: Cell::new(false) })
+        }
+
+        /// The X11 window the plugin creates its child window in (for `set_parent`).
+        pub fn handle(&self) -> clap_window_handle {
+            clap_window_handle { x11: c_ulong::from(self.win) }
+        }
+
+        pub fn raise(&self) {
+            if self.closed.get() {
+                return;
+            }
+            let _ = self.conn.map_window(self.win);
+            let _ = self.conn.configure_window(self.win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
+            let _ = self.conn.flush();
+        }
+
+        /// Drains pending events without blocking. False once the window manager asked to close
+        /// the window (`WM_DELETE_WINDOW`) or the connection failed, and for good after that.
+        pub fn is_visible(&self) -> bool {
+            if self.closed.get() {
+                return false;
+            }
+            loop {
+                match self.conn.poll_for_event() {
+                    Ok(Some(Event::ClientMessage(ev))) => {
+                        if ev.type_ == self.protocols && ev.data.as_data32().first() == Some(&self.delete) {
+                            self.closed.set(true);
+                            return false;
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => return true,
+                    Err(_) => {
+                        self.closed.set(true);
+                        return false;
+                    }
+                }
+            }
+        }
+
+        /// Resizes the client area and keeps it fixed at the new size.
+        pub fn resize(&self, w: f64, h: f64) {
+            if self.closed.get() {
+                return;
+            }
+            let (ww, wh) = (side(w), side(h));
+            let mut hints = WmSizeHints::new();
+            hints.min_size = Some((i32::from(ww), i32::from(wh)));
+            hints.max_size = Some((i32::from(ww), i32::from(wh)));
+            let _ = self.conn.configure_window(self.win, &ConfigureWindowAux::new().width(u32::from(ww)).height(u32::from(wh)));
+            let _ = hints.set_normal_hints(&self.conn, self.win);
+            let _ = self.conn.flush();
+        }
+
+        /// Destroys the window and closes the connection.
+        pub fn close(self) {
+            let _ = self.conn.destroy_window(self.win);
+            let _ = self.conn.flush();
+        }
+    }
+}
+
+/// Other platforms (macOS, Android, and non-Unix targets): embedded editors are not hosted
+/// (floating ones still are).
+#[cfg(not(any(windows, all(unix, not(target_os = "macos"), not(target_os = "android")))))]
+mod hostwin {
+    use clap_sys::ext::gui::clap_window_handle;
 
     pub const SUPPORTED: bool = false;
 
@@ -2087,20 +2415,16 @@ mod hostwin {
         pub fn new(_title: &str, _w: f64, _h: f64) -> Result<HostWindow, String> {
             Err("embedded plugin editors are not hosted on this platform".into())
         }
-        pub fn raw(&self) -> *mut c_void {
-            std::ptr::null_mut()
-        }
-        pub fn parent(&self) -> *mut c_void {
-            std::ptr::null_mut()
+        pub fn handle(&self) -> clap_window_handle {
+            clap_window_handle { ptr: std::ptr::null_mut() }
         }
         pub fn raise(&self) {}
         pub fn is_visible(&self) -> bool {
             false
         }
         pub fn close(self) {}
+        pub fn resize(&self, _w: f64, _h: f64) {}
     }
-
-    pub fn resize(_window: *mut c_void, _w: f64, _h: f64) {}
 }
 
 #[cfg(test)]

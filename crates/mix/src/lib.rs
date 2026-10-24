@@ -403,6 +403,11 @@ pub struct MixEngine {
     retired: Vec<Box<dyn Plugin>>,
     /// Ownership workspace reused for parallel strip processing.
     work: Vec<(usize, Strip)>,
+    /// Last block's strip work as a share of the block's duration (summed per-strip render time,
+    /// whichever threads did it). Strips render in parallel only when this says it pays.
+    strip_load: f64,
+    /// Whether the strips rendered in parallel last block (the gate has hysteresis).
+    parallel: bool,
 }
 
 /// What `sync` needs to fill a slot.
@@ -486,6 +491,8 @@ impl MixEngine {
             adopt: HashMap::new(),
             retired: Vec::new(),
             work: Vec::new(),
+            strip_load: 0.0,
+            parallel: false,
         }
     }
 
@@ -719,12 +726,16 @@ impl MixEngine {
         }
         let busses = std::mem::take(&mut self.busses);
         let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording };
-        run_strips(&mut work, |(i, st)| {
+        let parallel = go_parallel(self.parallel, self.strip_load, work.len());
+        let spent = run_strips(&mut work, parallel, |(i, st)| {
             if let Some(t) = s.tracks.get(*i) {
                 process_strip(s, t, st, &busses, &live_in, pos, frames, any_solo);
             }
         });
         self.busses = busses;
+        self.parallel = parallel;
+        let block_secs = frames as f64 / self.sample_rate as f64;
+        self.strip_load = if frames == 0 { 0.0 } else { spent.as_secs_f64() / block_secs };
         // Delay compensation: align every strip to the slowest. Direct-to-main outputs also wait
         // for the slowest aux return. Aux latency has to be read before those outputs are routed,
         // or the first block (and a one-block bounce probe) still sees zero.
@@ -1347,22 +1358,51 @@ fn as_audio_thread(audio: bool, f: impl FnOnce()) {
     f();
 }
 
-/// Process strips, in parallel on native targets when there are enough of them.
+/// Whether strips render in parallel this block: worth waking the pool only when there are
+/// several strips and their work is a real share of the block (enter above a quarter, stay
+/// above an eighth, so a load near the line doesn't flip every block).
+fn go_parallel(was: bool, load: f64, strips: usize) -> bool {
+    strips >= 4 && load > if was { 0.125 } else { 0.25 }
+}
+
+/// Process strips: in parallel on native targets when `parallel` says it pays, else on this
+/// thread. Returns the summed render time of the strips, whichever threads ran them (the
+/// caller turns it into the block's load). Parallel timing is summed across workers, so it can
+/// exceed the block's wall time.
 #[cfg(not(target_arch = "wasm32"))]
-fn run_strips<T: Send>(work: &mut [T], f: impl Fn(&mut T) + Sync + Send) {
+fn run_strips<T: Send>(work: &mut [T], parallel: bool, f: impl Fn(&mut T) + Sync + Send) -> std::time::Duration {
     use rayon::prelude::*;
-    if work.len() >= 4 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+    if parallel {
         // The workers render on behalf of this thread: on the audio thread, they are it too.
         let audio = on_audio_thread();
-        work.par_iter_mut().for_each(|w| as_audio_thread(audio, || f(w)));
+        let nanos = AtomicU64::new(0);
+        work.par_iter_mut().for_each(|w| {
+            as_audio_thread(audio, || {
+                let t0 = Instant::now();
+                f(w);
+                let d = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                nanos.fetch_add(d, Ordering::Relaxed);
+            })
+        });
+        Duration::from_nanos(nanos.load(Ordering::Relaxed))
     } else {
-        work.iter_mut().for_each(f);
+        let mut total = Duration::ZERO;
+        for w in work.iter_mut() {
+            let t0 = Instant::now();
+            f(w);
+            total = total.saturating_add(t0.elapsed());
+        }
+        total
     }
 }
 
+/// wasm32 has no `Instant` (it panics there), and no threads: strips run in order, untimed.
 #[cfg(target_arch = "wasm32")]
-fn run_strips<T: Send>(work: &mut [T], f: impl Fn(&mut T) + Sync + Send) {
+fn run_strips<T: Send>(work: &mut [T], _parallel: bool, f: impl Fn(&mut T) + Sync + Send) -> std::time::Duration {
     work.iter_mut().for_each(f);
+    std::time::Duration::ZERO
 }
 
 fn strip_channels(t: &Track, main_ch: usize) -> usize {
@@ -2354,7 +2394,7 @@ mod audio_thread_tests {
                 mark_audio_thread();
             }
             let mut work = vec![None; 64];
-            run_strips(&mut work, |w| {
+            run_strips(&mut work, true, |w| {
                 // Long enough that the pool's workers take part.
                 std::thread::sleep(std::time::Duration::from_millis(1));
                 *w = Some(on_audio_thread());
@@ -2369,6 +2409,58 @@ mod audio_thread_tests {
     fn strips_rendered_for_the_audio_thread_count_as_the_audio_thread_and_only_then() {
         assert!(seen_by_strips(true).iter().all(|&rt| rt), "a worker rendering for the audio thread is on it");
         assert!(seen_by_strips(false).iter().all(|&rt| !rt), "the workers don't stay marked afterwards");
+    }
+
+    #[test]
+    fn go_parallel_needs_several_strips_and_a_real_share_of_the_block() {
+        // Few strips never go parallel, however loaded.
+        assert!(!go_parallel(false, 10.0, 3));
+        assert!(!go_parallel(true, 10.0, 0));
+        // Light load stays sequential.
+        assert!(!go_parallel(false, 0.05, 16));
+        // Enters only above a quarter.
+        assert!(!go_parallel(false, 0.25, 16), "exactly a quarter is not above it");
+        assert!(go_parallel(false, 0.2501, 16));
+        // Once parallel, stays down to an eighth.
+        assert!(go_parallel(true, 0.2, 16));
+        assert!(go_parallel(true, 0.1251, 16));
+        assert!(!go_parallel(true, 0.125, 16), "exactly an eighth is not above it");
+        // Drops back below an eighth.
+        assert!(!go_parallel(true, 0.05, 16));
+        // NaN is never parallel, from either state.
+        assert!(!go_parallel(false, f64::NAN, 16));
+        assert!(!go_parallel(true, f64::NAN, 16));
+    }
+
+    #[test]
+    fn run_strips_sequential_stays_on_this_thread_and_times_the_work() {
+        let here = std::thread::current().id();
+        let mut work = vec![(); 8];
+        let threads = std::sync::Mutex::new(Vec::new());
+        let spent = run_strips(&mut work, false, |_| {
+            if let Ok(mut seen) = threads.lock() {
+                seen.push(std::thread::current().id());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        });
+        let seen = threads.into_inner().unwrap_or_default();
+        assert!(seen.len() == 8 && seen.iter().all(|&t| t == here), "every strip runs on the calling thread");
+        assert!(spent >= std::time::Duration::from_millis(8), "the time is the sum of the strips: {spent:?}");
+    }
+
+    #[test]
+    fn run_strips_parallel_spreads_the_work_over_threads() {
+        let ids = std::sync::Mutex::new(std::collections::HashSet::new());
+        let mut work = vec![(); 64];
+        let spent = run_strips(&mut work, true, |_| {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            if let Ok(mut set) = ids.lock() {
+                set.insert(std::thread::current().id());
+            }
+        });
+        let threads = ids.into_inner().map(|set| set.len()).unwrap_or(0);
+        assert!(threads > 1, "64 sleeping strips use more than one thread, got {threads}");
+        assert!(spent >= std::time::Duration::from_millis(64), "the summed time covers every strip: {spent:?}");
     }
 }
 

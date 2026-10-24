@@ -315,6 +315,7 @@ mod tests {
             "au:auou:def :appl",
             "au:aufx:dé:appl",
             "vst3:0123",
+            "lv2:http://example.org/plugin",
             "eq_7band",
             "",
         ] {
@@ -342,6 +343,7 @@ mod tests {
     fn foreign_ids_are_rejected_without_scanning() {
         assert!(create("eq_7band").is_none());
         assert!(create("vst3:0123456789ABCDEF0123456789ABCDEF").is_none());
+        assert!(create("lv2:http://example.org/plugin").is_none());
         assert!(plugin_info("reverb").is_none());
         assert!(plugin_info("au:aufx").is_none());
     }

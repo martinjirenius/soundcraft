@@ -1,0 +1,30 @@
+[package]
+name = "soundcraft-lv2-host"
+description = "SoundCraft LV2 plugin host: scans, loads and runs installed LV2 effects behind the safe soundcraft-dsp Plugin trait (an isolated unsafe crate, like soundcraft-clap-host)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+soundcraft-dsp.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+# The LV2 host library (MIT) over the system lilv (`liblilv-0`). Native only.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+livi.workspace = true
+
+# The isolated unsafe helper crate (craftrules never-crash): this crate opts out of the workspace
+# `unsafe_code = "forbid"` for itself only. It denies unsafe everywhere and allows it solely on the
+# FFI module (`src/ffi.rs`). The rest mirrors `[workspace.lints]`.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+too_many_arguments = "allow"
+type_complexity = "allow"

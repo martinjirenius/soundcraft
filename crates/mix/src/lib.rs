@@ -81,11 +81,13 @@ pub fn main_channels(s: &Session) -> usize {
 /// (insert slots use their index).
 pub const INSTRUMENT_SLOT: usize = usize::MAX;
 
-/// Hosted third-party plugin ids (CLAP or VST3): created off the audio thread in realtime use.
+/// Hosted third-party plugin ids (CLAP, VST3, Audio Units or LV2): created off the audio thread in
+/// realtime use.
 pub fn is_third_party(id: &str) -> bool {
     id.starts_with(soundcraft_clap_host::ID_PREFIX)
         || id.starts_with(soundcraft_vst3_host::ID_PREFIX)
         || id.starts_with(soundcraft_au_host::ID_PREFIX)
+        || id.starts_with(soundcraft_lv2_host::ID_PREFIX)
 }
 
 /// A third-party plugin instance a session needs: which slot, which plugin, how many channels,
@@ -2442,12 +2444,13 @@ pub fn render_track_pre_fader(s: &Session, track: TrackId, range: Range) -> Vec<
     out
 }
 
-/// A built-in plugin, else a hosted CLAP plugin (`clap:<id>`).
+/// A built-in plugin, else a hosted CLAP, VST3, Audio Unit or LV2 plugin.
 fn create_plugin(id: &str) -> Option<Box<dyn Plugin>> {
     soundcraft_dsp::create(id)
         .or_else(|| soundcraft_clap_host::create(id))
         .or_else(|| soundcraft_vst3_host::create(id))
         .or_else(|| soundcraft_au_host::create(id))
+        .or_else(|| soundcraft_lv2_host::create(id))
 }
 
 #[cfg(test)]

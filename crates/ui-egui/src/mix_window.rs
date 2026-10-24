@@ -655,8 +655,8 @@ pub fn plugin_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, oc
 }
 
 /// The instrument picker of an instrument track: a search field that takes typing at once, then
-/// (until something is typed) its instrument's editor and the built-in, CLAP, VST3 and Audio Units
-/// instruments.
+/// (until something is typed) its instrument's editor and the built-in, CLAP, VST3, LV2 and Audio
+/// Units instruments.
 pub fn instrument_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
     let slot = soundcraft_mix::INSTRUMENT_SLOT;
     let search = MenuSearch::show(ui, egui::Id::new(("instrument-search", id.0)), "Search instruments…");
@@ -727,20 +727,24 @@ fn run_pick(app: &mut SoundApp, ui: &Ui, cmd: &str, params: serde_json::Value) {
 }
 
 /// The plugins whose name or vendor holds the search text: the built-in ones, then Audio Units
-/// (listing them creates no instances) and whichever of CLAP and VST3 have been scanned, with a
-/// button to scan each of the others. Each plugin is listed once, in its preferred format (CLAP,
-/// then VST3, then AU); the format submenus still list every format. Returns the id picked.
+/// (listing them creates no instances) and whichever of CLAP, VST3 and LV2 have been scanned, with
+/// a button to scan each of the others. Each plugin is listed once, in its preferred format (CLAP,
+/// then VST3, then LV2, then AU); the format submenus still list every format. Returns the id picked.
 fn plugin_search(ui: &mut Ui, search: &MenuSearch, instruments: bool) -> Option<String> {
     let mut built_in: Vec<&soundcraft_dsp::PluginInfo> =
         soundcraft_dsp::plugins().iter().copied().filter(|p| p.is_instrument == instruments && search.matches(p.name)).collect();
     built_in.sort_by_cached_key(|p| p.name.to_lowercase());
-    let (clap, vst3) = (soundcraft_clap_host::cached(), soundcraft_vst3_host::cached());
+    let (clap, vst3, lv2) = (soundcraft_clap_host::cached(), soundcraft_vst3_host::cached(), soundcraft_lv2_host::cached());
     let mut hosted: Vec<(MenuPlugin, &'static str)> = Vec::new();
     for d in clap.iter().flatten().filter(|d| d.is_instrument == instruments) {
         hosted.push((MenuPlugin { id: d.id.clone(), name: d.name.clone(), vendor: d.vendor.clone() }, "CLAP"));
     }
     for d in vst3.iter().flatten().filter(|d| d.is_instrument == instruments) {
         hosted.push((MenuPlugin { id: d.id.clone(), name: d.name.clone(), vendor: d.vendor.clone() }, "VST3"));
+    }
+    // LV2 instruments get no notes yet (no MIDI to their atom port): not offered until they do.
+    for d in lv2.iter().flatten().filter(|d| !instruments && !d.is_instrument) {
+        hosted.push((MenuPlugin { id: d.id.clone(), name: d.name.clone(), vendor: d.vendor.clone() }, "LV2"));
     }
     for d in soundcraft_au_host::scan().into_iter().filter(|d| d.is_instrument == instruments) {
         hosted.push((MenuPlugin { id: d.id, name: d.name, vendor: d.vendor }, "AU"));
@@ -761,7 +765,7 @@ fn plugin_search(ui: &mut Ui, search: &MenuSearch, instruments: bool) -> Option<
     if n == 0 {
         ui.weak("No matches");
     }
-    if clap.is_none() || vst3.is_none() {
+    if clap.is_none() || vst3.is_none() || lv2.is_none() {
         ui.separator();
         ui.horizontal(|ui| {
             if clap.is_none() && ui.small_button("Scan CLAP").clicked() {
@@ -769,6 +773,9 @@ fn plugin_search(ui: &mut Ui, search: &MenuSearch, instruments: bool) -> Option<
             }
             if vst3.is_none() && ui.small_button("Scan VST3").clicked() {
                 soundcraft_vst3_host::scan();
+            }
+            if lv2.is_none() && ui.small_button("Scan LV2").clicked() {
+                soundcraft_lv2_host::scan();
             }
         });
     }
@@ -855,7 +862,7 @@ struct MenuPlugin {
     vendor: String,
 }
 
-/// Keeps, for each plugin, only the entries in its most preferred format (CLAP, then VST3, then AU),
+/// Keeps, for each plugin, only the entries in its most preferred format (CLAP, then VST3, then LV2, then AU),
 /// since the same plugin is installed in each format. Entries of one format are never collapsed, so
 /// two distinct plugins with equal keys both stay. Formats are told apart by match key.
 fn preferred_formats(hosted: Vec<(MenuPlugin, &'static str)>) -> Vec<(MenuPlugin, &'static str)> {
@@ -890,13 +897,14 @@ fn format_rank(format: &str) -> usize {
     match format {
         "CLAP" => 0,
         "VST3" => 1,
-        "AU" => 2,
-        _ => 3,
+        "LV2" => 2,
+        "AU" => 3,
+        _ => 4,
     }
 }
 
-/// The CLAP, VST3 and (on macOS) Audio Units submenus, of effects or of instruments; returns the
-/// id picked. Each format is scanned the first time its submenu opens, then cached by its host.
+/// The CLAP, VST3, LV2 and (on macOS) Audio Units submenus, of effects or of instruments; returns
+/// the id picked. Each format is scanned the first time its submenu opens, then cached by its host.
 fn hosted_menus(ui: &mut Ui, instruments: bool) -> Option<String> {
     let mut picked = None;
     ui.menu_button("CLAP", |ui| {
@@ -908,6 +916,13 @@ fn hosted_menus(ui: &mut Ui, instruments: bool) -> Option<String> {
     ui.menu_button("VST3", |ui| {
         let list = soundcraft_vst3_host::scan().into_iter().filter(|d| d.is_instrument == instruments);
         if let Some(p) = vendor_menus(ui, list.map(|d| MenuPlugin { id: d.id, name: d.name, vendor: d.vendor }).collect(), "No VST3 plugins found") {
+            picked = Some(p);
+        }
+    });
+    ui.menu_button("LV2", |ui| {
+        // LV2 instruments get no notes yet (no MIDI to their atom port): not offered until they do.
+        let list = soundcraft_lv2_host::scan().into_iter().filter(|d| !instruments && !d.is_instrument);
+        if let Some(p) = vendor_menus(ui, list.map(|d| MenuPlugin { id: d.id, name: d.name, vendor: d.vendor }).collect(), "No LV2 plugins found") {
             picked = Some(p);
         }
     });
@@ -951,12 +966,13 @@ fn vendor_menus(ui: &mut Ui, mut list: Vec<MenuPlugin>, none: &str) -> Option<St
     picked
 }
 
-/// A built-in plugin's description, else a hosted CLAP (`clap:<id>`), VST3 (`vst3:<class id>`) or
-/// Audio Unit (`au:<type>:<subtype>:<manufacturer>`) plugin's.
+/// A built-in plugin's description, else a hosted CLAP (`clap:<id>`), VST3 (`vst3:<class id>`),
+/// LV2 (`lv2:<uri>`) or Audio Unit (`au:<type>:<subtype>:<manufacturer>`) plugin's.
 pub fn plugin_info(id: &str) -> Option<&'static soundcraft_dsp::PluginInfo> {
     soundcraft_dsp::plugin_info(id)
         .or_else(|| soundcraft_clap_host::plugin_info(id))
         .or_else(|| soundcraft_vst3_host::plugin_info(id))
+        .or_else(|| soundcraft_lv2_host::plugin_info(id))
         .or_else(|| soundcraft_au_host::plugin_info(id))
 }
 
@@ -1380,8 +1396,12 @@ mod tests {
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].1, "CLAP");
 
-        let kept = preferred_formats(vec![hosted("Odd", "Vendor", "LV2"), hosted("Odd", "Vendor", "AU")]);
-        assert_eq!(kept[0].1, "AU");
+        let kept = preferred_formats(vec![hosted("Odd", "Vendor", "AU"), hosted("Odd", "Vendor", "LV2")]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].1, "LV2");
+
+        let kept = preferred_formats(vec![hosted("Odd", "Vendor", "LV2"), hosted("Odd", "Vendor", "VST3")]);
+        assert_eq!(kept[0].1, "VST3");
     }
 
     #[test]

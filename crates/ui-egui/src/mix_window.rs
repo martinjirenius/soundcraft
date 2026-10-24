@@ -621,7 +621,7 @@ pub fn plugin_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, oc
     let search = MenuSearch::show(ui, egui::Id::new(("plugin-search", id.0, slot)), "Search plugins…");
     if search.typing() {
         if let Some(plugin) = plugin_search(ui, &search, false) {
-            pick_insert(app, ui, id, slot, &plugin);
+            pick_insert(app, ui, "mix.insert", json!({"track": id.0, "slot": slot, "plugin": plugin}), id, slot);
         }
         return;
     }
@@ -644,13 +644,13 @@ pub fn plugin_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, oc
         ui.menu_button(format!("{c:?}"), |ui| {
             for p in soundcraft_dsp::plugins().iter().filter(|p| p.category == c && !p.is_instrument) {
                 if ui.button(p.name).clicked() {
-                    pick_insert(app, ui, id, slot, p.id);
+                    pick_insert(app, ui, "mix.insert", json!({"track": id.0, "slot": slot, "plugin": p.id}), id, slot);
                 }
             }
         });
     }
     if let Some(plugin) = hosted_menus(ui, false) {
-        pick_insert(app, ui, id, slot, &plugin);
+        pick_insert(app, ui, "mix.insert", json!({"track": id.0, "slot": slot, "plugin": plugin}), id, slot);
     }
 }
 
@@ -662,7 +662,7 @@ pub fn instrument_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
     let search = MenuSearch::show(ui, egui::Id::new(("instrument-search", id.0)), "Search instruments…");
     if search.typing() {
         if let Some(plugin) = plugin_search(ui, &search, true) {
-            run_pick(app, ui, "mix.instrument", json!({"track": id.0, "plugin": plugin}));
+            pick_insert(app, ui, "mix.instrument", json!({"track": id.0, "plugin": plugin}), id, slot);
         }
         return;
     }
@@ -704,14 +704,14 @@ pub fn instrument_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
         picked = Some(p);
     }
     if let Some(plugin) = picked {
-        run_pick(app, ui, "mix.instrument", json!({"track": id.0, "plugin": plugin}));
+        pick_insert(app, ui, "mix.instrument", json!({"track": id.0, "plugin": plugin}), id, slot);
     }
 }
 
-/// Inserts the plugin picked in an insert's menu and, as DAWs do, opens it once the audio engine has
-/// it (`SoundApp::open_inserted`).
-fn pick_insert(app: &mut SoundApp, ui: &Ui, id: TrackId, slot: usize, plugin: &str) {
-    match app.run("mix.insert", json!({"track": id.0, "slot": slot, "plugin": plugin})) {
+/// Puts the plugin picked in an insert's or the instrument's menu on the track (`cmd`) and, as DAWs
+/// do, opens it once the audio engine has it (`SoundApp::open_inserted`).
+fn pick_insert(app: &mut SoundApp, ui: &Ui, cmd: &str, params: serde_json::Value, id: TrackId, slot: usize) {
+    match app.run(cmd, params) {
         Ok(_) => app.pending_open = Some((id, slot)),
         Err(e) => app.ui.status = e,
     }

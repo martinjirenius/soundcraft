@@ -33,6 +33,7 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 log = "0.4"
 rayon = "1"
+thread-priority = "3.1"
 proptest = "1"
 
 # audio

@@ -1365,10 +1365,83 @@ fn go_parallel(was: bool, load: f64, strips: usize) -> bool {
     strips >= 4 && load > if was { 0.125 } else { 0.25 }
 }
 
+/// How a thread is scheduled: its policy and priority. The audio thread captures its own and
+/// its pool workers adopt it while they render for it, so the audio thread never waits on a
+/// worker at a lower priority.
+#[cfg(all(not(target_arch = "wasm32"), unix))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Sched {
+    policy: thread_priority::unix::ThreadSchedulePolicy,
+    priority: thread_priority::ThreadPriority,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), unix))]
+impl Sched {
+    /// The calling thread's scheduling, or `None` when the OS won't say.
+    fn current() -> Option<Sched> {
+        use thread_priority::unix::{get_thread_priority, thread_native_id, thread_schedule_policy};
+        Some(Sched { policy: thread_schedule_policy().ok()?, priority: get_thread_priority(thread_native_id()).ok()? })
+    }
+
+    /// Give the calling thread this scheduling; false when the OS refuses (no rtprio permission).
+    fn apply(self) -> bool {
+        use thread_priority::unix::{set_thread_priority_and_policy, thread_native_id};
+        set_thread_priority_and_policy(thread_native_id(), self.priority, self.policy).is_ok()
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), windows))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Sched {
+    priority: thread_priority::ThreadPriority,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), windows))]
+impl Sched {
+    fn current() -> Option<Sched> {
+        Some(Sched { priority: thread_priority::get_current_thread_priority().ok()? })
+    }
+
+    fn apply(self) -> bool {
+        thread_priority::set_current_thread_priority(self.priority).is_ok()
+    }
+}
+
+/// Adopt `sched` on this worker unless it already runs at it (`APPLIED` is what this worker last
+/// adopted, so a steady caller costs one thread-local read per strip).
+#[cfg(not(target_arch = "wasm32"))]
+fn adopt(sched: Option<Sched>) {
+    std::thread_local! {
+        static APPLIED: std::cell::Cell<Option<Sched>> = const { std::cell::Cell::new(None) };
+    }
+    if let Some(s) = sched
+        && APPLIED.get() != sched
+        && s.apply()
+    {
+        APPLIED.set(sched);
+    }
+}
+
+/// The pool audio-thread renders run on, so they never queue behind bounce workers. Built the
+/// first time an audio-thread render goes parallel (a one-time thread spawn on that block; the
+/// gate means it is already a heavy session). `None` if the pool can't be built.
+#[cfg(not(target_arch = "wasm32"))]
+fn rt_pool() -> Option<&'static rayon::ThreadPool> {
+    static RT_POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    RT_POOL
+        .get_or_init(|| {
+            let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+            let n = cores.saturating_sub(1).clamp(1, 8);
+            rayon::ThreadPoolBuilder::new().num_threads(n).thread_name(|i| format!("sc-mix-{i}")).build().ok()
+        })
+        .as_ref()
+}
+
 /// Process strips: in parallel on native targets when `parallel` says it pays, else on this
 /// thread. Returns the summed render time of the strips, whichever threads ran them (the
 /// caller turns it into the block's load). Parallel timing is summed across workers, so it can
-/// exceed the block's wall time.
+/// exceed the block's wall time. Audio-thread renders go parallel on the [`rt_pool`] at the
+/// caller's scheduling; bounces use the global pool.
 #[cfg(not(target_arch = "wasm32"))]
 fn run_strips<T: Send>(work: &mut [T], parallel: bool, f: impl Fn(&mut T) + Sync + Send) -> std::time::Duration {
     use rayon::prelude::*;
@@ -1377,15 +1450,24 @@ fn run_strips<T: Send>(work: &mut [T], parallel: bool, f: impl Fn(&mut T) + Sync
     if parallel {
         // The workers render on behalf of this thread: on the audio thread, they are it too.
         let audio = on_audio_thread();
+        let sched = if audio { Sched::current() } else { None };
         let nanos = AtomicU64::new(0);
-        work.par_iter_mut().for_each(|w| {
+        let job = |w: &mut T| {
             as_audio_thread(audio, || {
+                adopt(sched);
                 let t0 = Instant::now();
                 f(w);
                 let d = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 nanos.fetch_add(d, Ordering::Relaxed);
             })
-        });
+        };
+        // Without its own pool, the audio thread renders alone: promoting the global pool's
+        // workers would leave bounces running on them at realtime priority.
+        match (audio, rt_pool()) {
+            (true, Some(pool)) => pool.install(|| work.par_iter_mut().for_each(job)),
+            (true, None) => work.iter_mut().for_each(job),
+            (false, _) => work.par_iter_mut().for_each(job),
+        }
         Duration::from_nanos(nanos.load(Ordering::Relaxed))
     } else {
         let mut total = Duration::ZERO;
@@ -2461,6 +2543,84 @@ mod audio_thread_tests {
         let threads = ids.into_inner().map(|set| set.len()).unwrap_or(0);
         assert!(threads > 1, "64 sleeping strips use more than one thread, got {threads}");
         assert!(spent >= std::time::Duration::from_millis(64), "the summed time covers every strip: {spent:?}");
+    }
+
+    /// The name of the thread each strip runs on, for strips run from a thread named `caller`
+    /// that is (or is not) the audio thread.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn strip_thread_names(audio: bool) -> Vec<String> {
+        std::thread::Builder::new()
+            .name("caller".into())
+            .spawn(move || {
+                if audio {
+                    mark_audio_thread();
+                }
+                let mut work: Vec<Option<String>> = vec![None; 64];
+                run_strips(&mut work, true, |w| {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    *w = Some(std::thread::current().name().unwrap_or_default().to_string());
+                });
+                work.into_iter().map(|w| w.unwrap_or_default()).collect()
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn an_audio_thread_render_runs_on_the_mix_pool() {
+        let names = strip_thread_names(true);
+        assert!(names.iter().all(|n| n.starts_with("sc-mix-") || n == "caller"), "audio-thread strips run on the mix pool or the caller: {names:?}");
+        assert!(names.iter().any(|n| n.starts_with("sc-mix-")), "some strips ran on the mix pool");
+        let bounce = strip_thread_names(false);
+        assert!(bounce.iter().all(|n| !n.starts_with("sc-mix-")), "bounces never use the mix pool: {bounce:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pool_workers_take_the_audio_threads_priority() {
+        use thread_priority::unix::{thread_native_id, thread_schedule_policy};
+        use thread_priority::{RealtimeThreadSchedulePolicy, ThreadPriority, ThreadPriorityValue, ThreadSchedulePolicy};
+        let fifo = ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo);
+        let Ok(value) = ThreadPriorityValue::try_from(10u8) else { return };
+        // Build the pool from this normal-priority thread: its workers inherit the creator's
+        // policy, and the promoted thread below would otherwise hand them FIFO for free.
+        let _ = rt_pool();
+        let promoted = std::thread::spawn(move || {
+            mark_audio_thread();
+            if thread_priority::unix::set_thread_priority_and_policy(thread_native_id(), ThreadPriority::Crossplatform(value), fifo).is_err() {
+                return None;
+            }
+            let caller = Sched::current();
+            let mut work: Vec<Option<Option<Sched>>> = vec![None; 64];
+            run_strips(&mut work, true, |w| {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                *w = Some(Sched::current());
+            });
+            Some((caller, work.into_iter().map(|w| w.unwrap_or_default()).collect::<Vec<_>>()))
+        })
+        .join()
+        .unwrap();
+        let Some((caller, seen)) = promoted else {
+            eprintln!("note: no permission for SCHED_FIFO here; the priority test is skipped");
+            return;
+        };
+        assert_eq!(caller.map(|s| s.policy), Some(fifo), "the promoted caller runs SCHED_FIFO");
+        assert!(seen.iter().all(|&s| s == caller), "every pool worker runs at the audio thread's scheduling: {seen:?}");
+
+        // A bounce from a normal thread leaves the global pool's workers at normal policy.
+        let bounce = std::thread::spawn(|| {
+            let mut work: Vec<Option<Option<ThreadSchedulePolicy>>> = vec![None; 64];
+            run_strips(&mut work, true, |w| {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                *w = Some(thread_schedule_policy().ok());
+            });
+            work.into_iter().map(|w| w.unwrap_or_default()).collect::<Vec<_>>()
+        })
+        .join()
+        .unwrap();
+        assert!(bounce.iter().all(|&p| p != Some(fifo)), "bounce workers are not promoted: {bounce:?}");
     }
 }
 

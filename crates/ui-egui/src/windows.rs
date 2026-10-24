@@ -436,7 +436,9 @@ fn chosen_device<'a>(devices: &'a [DeviceInfo], id: Option<&str>) -> Option<&'a 
     id.and_then(|n| devices.iter().find(|d| d.id == n)).or_else(|| devices.iter().find(|d| d.is_default))
 }
 
-fn device_combo(ui: &mut egui::Ui, id: &str, value: &mut Option<String>, devices: &[DeviceInfo]) {
+/// `show_monitors`: whether the monitors of outputs are offered (an input list hides them by
+/// default). The chosen device is always offered, so a choice never disappears from the list.
+fn device_combo(ui: &mut egui::Ui, id: &str, value: &mut Option<String>, devices: &[DeviceInfo], show_monitors: bool) {
     let default = devices.iter().find(|d| d.is_default).map_or("Default".to_string(), |d| format!("Default ({})", d.name));
     // A remembered device that is gone stays visible.
     let shown = match value.as_deref() {
@@ -445,7 +447,8 @@ fn device_combo(ui: &mut egui::Ui, id: &str, value: &mut Option<String>, devices
     };
     egui::ComboBox::from_id_salt(id).width(300.0).selected_text(shown).show_ui(ui, |ui| {
         ui.selectable_value(value, None, default);
-        for d in devices {
+        let chosen = value.clone();
+        for d in devices.iter().filter(|d| show_monitors || !d.monitor || chosen.as_deref() == Some(d.id.as_str())) {
             // The name, then what tells it apart from its neighbours.
             let text = if d.detail.is_empty() { d.name.clone() } else { format!("{} ({})", d.name, d.detail) };
             ui.selectable_value(value, Some(d.id.clone()), text).on_hover_text(&d.id);
@@ -471,6 +474,8 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
     }
     let draft_id = egui::Id::new("audio_draft");
     let mut draft = ctx.data(|d| d.get_temp::<AudioConfig>(draft_id)).unwrap_or_else(|| app.ui.audio.clone());
+    let monitors_id = egui::Id::new("pe-show-monitors");
+    let mut show_monitors = ctx.data(|d| d.get_temp::<bool>(monitors_id)).unwrap_or(false);
     let mut refresh = false;
     let mut apply = false;
     let systems = audio_systems(ctx, false);
@@ -501,10 +506,14 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
             ui.end_row();
             let sys = chosen_system(&systems, &draft);
             ui.label("Output device");
-            device_combo(ui, "pe-out", &mut draft.output, sys.map_or(&[][..], |s| &s.outputs));
+            device_combo(ui, "pe-out", &mut draft.output, sys.map_or(&[][..], |s| &s.outputs), true);
             ui.end_row();
             ui.label("Input device");
-            device_combo(ui, "pe-in", &mut draft.input, sys.map_or(&[][..], |s| &s.inputs));
+            ui.horizontal(|ui| {
+                device_combo(ui, "pe-in", &mut draft.input, sys.map_or(&[][..], |s| &s.inputs), show_monitors);
+                // A monitor records what an output plays: an input list hides them unless asked.
+                crate::widgets::checkbox(ui, &mut show_monitors, "Show monitors").on_hover_text("List the monitors of outputs as inputs");
+            });
             ui.end_row();
             let out = sys.and_then(|s| chosen_device(&s.outputs, draft.output.as_deref()));
             ui.label("Sample rate");
@@ -572,11 +581,15 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
         app.ui.status = e;
     }
     if open {
-        ctx.data_mut(|d| d.insert_temp(draft_id, draft));
+        ctx.data_mut(|d| {
+            d.insert_temp(draft_id, draft);
+            d.insert_temp(monitors_id, show_monitors);
+        });
     } else {
         // Closing discards unapplied edits and the device list (re-read on the next open).
         ctx.data_mut(|d| {
             d.remove_temp::<AudioConfig>(draft_id);
+            d.remove_temp::<bool>(monitors_id);
             d.remove_temp::<Arc<Vec<AudioSystem>>>(egui::Id::new("audio_systems"));
         });
     }

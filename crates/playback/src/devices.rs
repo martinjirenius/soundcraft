@@ -37,6 +37,9 @@ pub struct DeviceInfo {
     pub name: String,
     /// What tells it apart from its neighbours (`"USB · 2 ch"`); may be empty.
     pub detail: String,
+    /// The monitor of an output (records what it plays, not a real input); the settings window
+    /// hides these from the input list by default.
+    pub monitor: bool,
     pub is_default: bool,
     /// Most channels any usable configuration offers.
     pub max_channels: u16,
@@ -90,6 +93,7 @@ fn describe(info: crate::host::DeviceInfo, device: Option<&cpal::Device>, defaul
         id: info.id,
         name: info.name,
         detail: info.detail,
+        monitor: info.monitor,
         max_channels,
         sample_rates,
         buffer_min,
@@ -160,6 +164,7 @@ mod tests {
             id: "x".into(),
             name: "x".into(),
             detail: String::new(),
+            monitor: false,
             is_default: true,
             max_channels: 2,
             sample_rates: vec![48_000],

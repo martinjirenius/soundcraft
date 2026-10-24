@@ -45,7 +45,9 @@ pub(super) fn groups(direction: Direction) -> Vec<DeviceInfo> {
             None => out.push((group.to_string(), 1)),
         }
     }
-    out.into_iter().map(|(group, n)| DeviceInfo { id: format!("{ID}{group}"), name: tidy_group(&group), detail: format!("{n} ch") }).collect()
+    out.into_iter()
+        .map(|(group, n)| DeviceInfo { id: format!("{ID}{group}"), name: tidy_group(&group), detail: format!("{n} ch"), monitor: false })
+        .collect()
 }
 
 /// PipeWire names a group after the device and its profile, often saying the device twice.

@@ -76,6 +76,9 @@ pub struct DeviceInfo {
     /// What tells it apart from its neighbours (`"USB · 2 ch"`, `"direct · hw:CARD=0,DEV=0"`); may
     /// be empty.
     pub detail: String,
+    /// The monitor of a PipeWire output: it records what that output plays, not a real input.
+    /// Listed after the real devices; hidden by default in the settings window.
+    pub monitor: bool,
 }
 
 /// Use this host for the rest of the run, whatever [`configure`] is given (the command line's
@@ -329,7 +332,7 @@ pub(crate) fn listed(host: &cpal::Host, host_name: &str, direction: Direction) -
         if let Some(n) = channels.filter(|n| *n < 64) {
             detail.insert(0, format!("{n} ch"));
         }
-        out.push((monitor, DeviceInfo { id, name, detail: detail.join(" · ") }, d));
+        out.push((monitor, DeviceInfo { id, name, detail: detail.join(" · "), monitor }, d));
     }
     out.sort_by_key(|(monitor, ..)| *monitor);
     out.into_iter().map(|(_, info, d)| (info, Some(d))).collect()

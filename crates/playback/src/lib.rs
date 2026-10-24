@@ -577,7 +577,8 @@ pub struct Player {
     pub device_rate: u32,
     /// Output channels the device was opened with (0 for the silent clock).
     pub device_channels: u16,
-    /// The device buffer in frames when one was chosen (`None`: the device default).
+    /// The buffer in frames the stream opened with (`None`: the device's own default, used when the
+    /// device refused the requested size).
     pub device_buffer: Option<u32>,
     /// True when no audio device could be opened (silent clock).
     pub silent: bool,

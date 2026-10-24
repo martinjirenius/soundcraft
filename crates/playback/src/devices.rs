@@ -25,7 +25,7 @@ pub struct AudioConfig {
     pub input: Option<String>,
     /// Device sample rate; the mix resamples when it differs from the session's.
     pub sample_rate: Option<u32>,
-    /// Device buffer in frames.
+    /// Device buffer in frames. `None` means SoundCraft's default of 64 frames.
     pub buffer_size: Option<u32>,
 }
 
@@ -150,7 +150,10 @@ mod tests {
         // Outside the range: the nearest size the device has.
         assert_eq!(buffer_size(Some(32), &r), cpal::BufferSize::Fixed(64));
         assert_eq!(buffer_size(Some(4096), &r), cpal::BufferSize::Fixed(1024));
-        assert_eq!(buffer_size(None, &r), cpal::BufferSize::Default);
+        // No choice made: SoundCraft asks for 64 frames, not the device's default (PipeWire's
+        // default is 1024 frames, about 114 ms of round trip).
+        assert_eq!(buffer_size(None, &r), cpal::BufferSize::Fixed(64));
+        assert_eq!(buffer_size(None, &cpal::SupportedBufferSize::Unknown), cpal::BufferSize::Fixed(64));
         assert_eq!(buffer_size(Some(128), &cpal::SupportedBufferSize::Unknown), cpal::BufferSize::Fixed(128));
         assert_eq!(buffer_size(Some(1 << 20), &cpal::SupportedBufferSize::Unknown), cpal::BufferSize::Default);
         let d = DeviceInfo {

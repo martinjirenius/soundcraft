@@ -30,8 +30,12 @@ static FORCED: Mutex<Option<String>> = Mutex::new(None);
 /// Device buffer sizes (frames) offered in the Playback Engine dialog.
 pub const BUFFER_SIZES: [u32; 10] = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
 
-/// Ask the devices for this buffer size (frames per callback) from now on; `None` leaves it to
-/// the host. Smaller is less delay between playing and hearing, larger is safer against
+/// The buffer size (frames per callback) asked for when none was chosen. It sets the delay between
+/// playing and hearing; a bigger buffer is one choice away in Setup > Playback Engine if it crackles.
+pub const DEFAULT_BUFFER: u32 = 64;
+
+/// Ask the devices for this buffer size (frames per callback) from now on; `None` means
+/// [`DEFAULT_BUFFER`]. Smaller is less delay between playing and hearing, larger is safer against
 /// crackles. The host may give another size (PipeWire keeps to its own quantum limits).
 pub fn set_preferred_buffer_size(frames: Option<u32>) {
     *BUFFER_SIZE.lock().unwrap_or_else(PoisonError::into_inner) = frames.filter(|n| (8..=65_536).contains(n));
@@ -41,14 +45,14 @@ pub fn preferred_buffer_size() -> Option<u32> {
     *BUFFER_SIZE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The buffer size to open a stream with: `want` brought into what the device supports.
+/// The buffer size to open a stream with: `want` (`None`: [`DEFAULT_BUFFER`]) brought into what the
+/// device supports.
 pub(crate) fn buffer_size(want: Option<u32>, supported: &cpal::SupportedBufferSize) -> cpal::BufferSize {
-    match (want, supported) {
-        (None, _) => cpal::BufferSize::Default,
-        (Some(n), cpal::SupportedBufferSize::Range { min, max }) if min <= max => cpal::BufferSize::Fixed(n.clamp(*min, *max)),
+    match (want.unwrap_or(DEFAULT_BUFFER), supported) {
+        (n, cpal::SupportedBufferSize::Range { min, max }) if min <= max => cpal::BufferSize::Fixed(n.clamp(*min, *max)),
         // The device does not say what it takes: ask, within reason (a refusal falls back to the
         // device's own size).
-        (Some(n), _) if (16..=8192).contains(&n) => cpal::BufferSize::Fixed(n),
+        (n, _) if (16..=8192).contains(&n) => cpal::BufferSize::Fixed(n),
         _ => cpal::BufferSize::Default,
     }
 }

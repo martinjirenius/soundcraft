@@ -453,10 +453,10 @@ fn device_combo(ui: &mut egui::Ui, id: &str, value: &mut Option<String>, devices
     });
 }
 
-fn number_combo(ui: &mut egui::Ui, id: &str, value: &mut Option<u32>, options: &[u32], unit: &str) {
-    let shown = value.map_or("Device default".to_string(), |v| format!("{v} {unit}"));
+fn number_combo(ui: &mut egui::Ui, id: &str, value: &mut Option<u32>, options: &[u32], unit: &str, none: &str) {
+    let shown = value.map_or(none.to_string(), |v| format!("{v} {unit}"));
     egui::ComboBox::from_id_salt(id).width(300.0).selected_text(shown).show_ui(ui, |ui| {
-        ui.selectable_value(value, None, "Device default");
+        ui.selectable_value(value, None, none);
         for v in options {
             ui.selectable_value(value, Some(*v), format!("{v} {unit}"));
         }
@@ -508,11 +508,12 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
             ui.end_row();
             let out = sys.and_then(|s| chosen_device(&s.outputs, draft.output.as_deref()));
             ui.label("Sample rate");
-            number_combo(ui, "pe-rate", &mut draft.sample_rate, out.map_or(&[][..], |d| &d.sample_rates), "Hz");
+            number_combo(ui, "pe-rate", &mut draft.sample_rate, out.map_or(&[][..], |d| &d.sample_rates), "Hz", "Device default");
             ui.end_row();
             ui.label("Buffer size");
             let buffers = out.map(DeviceInfo::buffer_sizes).unwrap_or_else(|| soundcraft_playback::devices::STANDARD_BUFFERS.to_vec());
-            number_combo(ui, "pe-buffer", &mut draft.buffer_size, &buffers, "samples");
+            let buffer_default = format!("Default ({} samples)", soundcraft_playback::host::DEFAULT_BUFFER);
+            number_combo(ui, "pe-buffer", &mut draft.buffer_size, &buffers, "samples", &buffer_default);
             ui.end_row();
         });
         ui.add_space(4.0);
